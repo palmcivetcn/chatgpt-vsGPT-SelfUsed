@@ -1,0 +1,6445 @@
+// ==UserScript==
+// @name         ChatGPT Glass Engine  super v1.2.0
+// @namespace    local.chatgpt.optimizer
+// @version      9.1.0
+// @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复 + Token估算
+// @license      MIT
+// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/*
+// @connect      chatgpt.com
+// @connect      chat.openai.com
+// @connect      status.openai.com
+// @connect      scamalytics.com
+// @connect      cloudflare.com
+// @connect      www.cloudflare.com
+// @connect      ipinfo.io
+// @connect      uapis.cn
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // region: Environment Guard & Session
+  // ========================== 运行环境守护（避免与 KeepChatGPT IFRAME 冲突） ==========================
+  const isTopFrame = (() => {
+    try {
+      return window.top === window.self;
+    }
+    catch {
+      return false;
+    }
+  })();
+  if (!isTopFrame) return;
+
+  const ct = (document.contentType || '').toLowerCase();
+  if (ct && !ct.includes('text/html')) return;
+
+  const path = location.pathname || '';
+  if (/^\/(api|auth|backend|v1|v2|_next|cdn-cgi)\b/i.test(path)) return;
+
+  const PAGE_WIN = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  if (PAGE_WIN.__CGPT_GLASS_LOADED__ || PAGE_WIN.__CGPT_VS_LOADED__ || window.__CGPT_VS_LOADED__) return;
+  PAGE_WIN.__CGPT_GLASS_LOADED__ = true;
+  PAGE_WIN.__CGPT_VS_LOADED__ = true;
+  window.__CGPT_VS_LOADED__ = true;
+  const SESSION_STARTED_AT = Date.now();
+  const SESSION_ID = (() => {
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${SESSION_STARTED_AT.toString(36)}-${rand}`;
+  })();
+  // endregion: Environment Guard & Session
+
+
+  // region: Tunables & Constants
+  // ========================== 可调参数（一般不用动） ==========================
+  const CHECK_INTERVAL_MS = 1500;
+  const ROUTE_GUARD_MS = 1200;
+  const INPUT_DIM_IDLE_MS = 850;
+  const IMAGE_LOAD_RETRY_MS = 250;
+  const POS_FOLLOW_MS = 450;
+  const POS_FOLLOW_WHEN_OPEN_MS = 250;
+  const FLOAT_Y_OFFSET_PX = 0;
+  const RESTORE_LAST_OPEN = false;
+  const INIT_LIGHT_UI_MS = 1200;
+  const INIT_VIRTUALIZE_DELAY_MS = 600;
+  const SCRIPT_VERSION = '8.0.0';
+  const VS_SLIM_CLASS = 'cgpt-vs-slim';
+  const SUPPORTS_CV = (() => {
+    try {
+      return typeof CSS !== 'undefined' && CSS.supports && CSS.supports('content-visibility: auto');
+    }
+    catch {
+      return false;
+    }
+  })();
+  const DOM_COUNT_TTL_MS = 4000;
+  const TOKEN_UPDATE_MIN_MS = 5000;
+  const TOKEN_UPDATE_MAX_MS = 18000;
+  const CHAT_BUSY_TTL_MS = 900;
+  const CHAT_BUSY_MAX_SCAN = 80;
+  const CHAT_BUSY_GRACE_MS = 2600;
+  const SCROLL_ROOT_TTL_MS = 3200;
+  const MARGIN_TTL_MS = 2400;
+  const TURNS_COUNT_TTL_MS = 900;
+  const MARGIN_TURN_STEPS = [80, 180, 320, 520];
+  const MODEL_BTN_TTL_MS = 3000;
+  const OPTIMIZE_HOLD_MS = 420;
+  const HARD_SLICE_TURNS = 140;
+  const HARD_SLICE_BUDGET_MIN_MS = 4;
+  const HARD_SLICE_BUDGET_MAX_MS = 12;
+  const HARD_SLICE_MIN_ITEMS = 10;
+  const HARD_SLICE_MAX_ITEMS = 120;
+  const HARD_SLICE_RESTART_RATIO = 0.6;
+  const OPTIMIZE_IDLE_CLEAR_MS = 2000;
+  const HARD_SCROLL_IDLE_MS = 160;
+  const HARD_SCROLL_MAX_DEFER_MS = 1200;
+  const SOFT_SYNC_DEBOUNCE_MS = 160;
+  const SOFT_SYNC_CHAT_DEBOUNCE_MS = 520;
+  const UI_FULL_REFRESH_OPEN_MS = 900;
+  const UI_FULL_REFRESH_CLOSED_MS = 2600;
+  const UI_FULL_REFRESH_BUSY_MS = 2000;
+  const MOOD_ROTATE_MS = 28000;
+  const MOOD_BALANCE_THRESHOLD_PX = 24;
+  const MSG_CACHE_TTL_MS = 2600;
+  const OPTIMIZE_PLAN_HOLD_MS = 12000;
+  const OPTIMIZE_PRESSURE_MED = 0.6;
+  const OPTIMIZE_PRESSURE_HIGH = 0.85;
+  const OPTIMIZE_PRESSURE_CRITICAL = 1.05;
+
+  const MODE_MARGIN_LIMITS = {
+    performance: { minSoft: 1, minHard: 2, maxSoft: 2, maxHard: 4 },
+    balanced: { minSoft: 1, minHard: 2, maxSoft: 3, maxHard: 6 },
+    conservative: { minSoft: 2, minHard: 4, maxSoft: 4, maxHard: 8 }
+  };
+
+  // DP planner weights: higher "overscan" favors smaller margins (performance),
+  // higher "change" favors stability (conservative).
+  const MODE_PLAN_WEIGHTS = {
+    performance: { soft: 3.2, hard: 2.4, change: 1.8, overscan: 2.2 },
+    balanced: { soft: 2.4, hard: 2.2, change: 2.6, overscan: 1.4 },
+    conservative: { soft: 1.8, hard: 1.6, change: 3.4, overscan: 0.6 }
+  };
+
+  const MODE_TO_SOFT_MARGIN_SCREENS = {
+    performance: 1,
+    balanced: 2,
+    conservative: 3
+  };
+
+  const MODE_TO_HARD_MARGIN_SCREENS = {
+    performance: 2,
+    balanced: 4,
+    conservative: 6
+  };
+
+  const MEM_STABLE_MB = 220;
+  const MEM_WARNING_MB = 520;
+
+  const DOM_OK = 7000;
+  const DOM_WARN = 15000;
+
+  // Auto optimize only after chat volume reaches a likely-lag threshold.
+  const AUTO_OPTIMIZE_MIN_TURNS = MARGIN_TURN_STEPS[0];
+
+  const AUTO_HARD_DOM_THRESHOLD = DOM_WARN;
+  const AUTO_HARD_COOLDOWN_MS = 9000;
+  const HARD_PASS_MIN_MS = 160;
+  const AUTO_HARD_EXIT_DOM = DOM_OK;
+  const AUTO_HARD_EXIT_MS = 4500;
+  const AUTO_HARD_TURN_STEPS = [80, 160, 240, 320];
+  const AUTO_HARD_TURN_FACTORS = [1.08, 1.0, 0.95, 0.9, 0.85];
+
+  // ========================== 服务降级监控常量 ==========================
+  const DEG_STATUS_REFRESH_MS = 2 * 60 * 1000;
+  const DEG_IP_REFRESH_MS = 6 * 60 * 1000;
+  const DEG_FETCH_MONITOR_FAST_MS = 1200;
+  const DEG_FETCH_MONITOR_SLOW_MS = 7000;
+  const DEG_STATUS_TTL_MS = 5 * 60 * 1000;
+  const DEG_IP_TTL_MS = 12 * 60 * 1000;
+  const DEG_POW_TTL_MS = 6 * 60 * 1000;
+  const DEG_POW_PROBE_COOLDOWN_MS = 90 * 1000;
+  const DEG_IP_COOLDOWN_MS = 12 * 1000;
+  const DEG_REQ_TIMEOUT_MS = 5000;
+  const DEG_CACHE_KEY = 'cgpt_glass_degraded_cache';
+  const DEG_CACHE_VERSION = 1;
+  const DEG_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  const MOOD_API_URL = 'https://uapis.cn/api/v1/saying';
+  const MOOD_CACHE_TEXT_KEY = 'cgpt_glass_mood_text';
+  const MOOD_CACHE_DATE_KEY = 'cgpt_glass_mood_date';
+  const MOOD_CACHE_SOURCE_KEY = 'cgpt_glass_mood_source';
+  const MOOD_CACHE_ATTEMPT_KEY = 'cgpt_glass_mood_attempt';
+  // endregion: Tunables & Constants
+
+  // ========================== Feature Pack（Token） ==========================
+  // region: I18N & Labels
+  const lang = 'zh';
+
+  const I18N = {
+    zh: {
+      token: 'Token 估算',
+      optimizeSoft: '优化',
+      optimizeSoftTip: '自动优化：根据负载规划软/硬与屏数',
+      optimizeStandby: '未达阈值，待优化',
+      optimizeBelowThreshold: '未达阈值',
+      optimizeHard: '硬优化',
+      optimizeHardTip: '硬虚拟化：远距内容替换为占位，显著降低 DOM',
+      newChat: '新开对话',
+      help: '帮助',
+      health: '健康',
+      autoPause: '回复避让',
+      autoPauseTip: '回复生成时自动暂停优化，减少干扰与闪烁',
+      scrollLatest: '回到底部',
+      scrollLatestTip: '快速滚动到最新回复位置',
+      sectionStatus: '状态总览',
+      sectionRuntime: '运行控制',
+      sectionOptimize: '优化操作',
+      sectionStats: '性能读数',
+      sectionMonitor: '降级监控',
+      stateRunning: '运行中',
+      statePaused: '暂停中',
+      pauseByChat: '回复中',
+      pauseByFind: '搜索中',
+      pauseByManual: '手动暂停',
+      monitor: '降级监控',
+      monitorRefresh: '刷新监控',
+      monitorRefreshTip: '刷新服务状态、IP质量与PoW难度',
+      monitorService: '服务状态',
+      monitorIp: 'IP 质量',
+      monitorPow: 'PoW 难度',
+      monitorUnknown: '未知',
+      monitorPowWaiting: '等待触发',
+      monitorPowTip: 'PoW 难度越低越顺滑（绿色最好）',
+      monitorIpTip: 'IP 质量来自 Scamalytics 评分',
+      monitorServiceTip: '来自 status.openai.com 的官方状态',
+      monitorOpenStatus: '打开状态页',
+      monitorCopyHistory: '点击复制历史',
+      monitorCopyHint: '点击复制最近 10 条记录',
+      monitorCopied: '已复制',
+      monitorCopyFailed: '复制失败',
+      logExport: '导出日志',
+      logExportTip: '下载诊断日志（txt）',
+      logExported: '已导出',
+      moodTitle: '每日名言',
+      moodTip: '点击换一句',
+      moodSub: '给今天一点轻松感',
+      riskVeryEasy: '非常容易',
+      riskEasy: '容易',
+      riskMedium: '中等',
+      riskHard: '困难',
+      riskCritical: '严重',
+      riskUnknown: '未知'
+    },
+    en: {
+      token: 'Token Estimate',
+      optimizeSoft: 'Optimize',
+      optimizeSoftTip: 'Auto optimize: plan soft/hard and screen ranges by load',
+      optimizeStandby: 'standby, below threshold',
+      optimizeBelowThreshold: 'Below threshold',
+      optimizeHard: 'Hard Optimize',
+      optimizeHardTip: 'Hard mode: replace far content to reduce DOM',
+      newChat: 'New chat',
+      help: 'Help',
+      health: 'Healthy',
+      autoPause: 'Auto pause',
+      autoPauseTip: 'Pause optimization while the assistant is replying',
+      scrollLatest: 'Latest',
+      scrollLatestTip: 'Jump to the latest reply',
+      sectionStatus: 'Status Overview',
+      sectionRuntime: 'Runtime Controls',
+      sectionOptimize: 'Optimize Actions',
+      sectionStats: 'Performance Stats',
+      sectionMonitor: 'Degradation Monitor',
+      stateRunning: 'Running',
+      statePaused: 'Paused',
+      pauseByChat: 'Replying',
+      pauseByFind: 'Finding',
+      pauseByManual: 'Manual pause',
+      monitor: 'Monitor',
+      monitorRefresh: 'Refresh',
+      monitorRefreshTip: 'Refresh status, IP quality, and PoW difficulty',
+      monitorService: 'Service',
+      monitorIp: 'IP Quality',
+      monitorPow: 'PoW Difficulty',
+      monitorUnknown: 'Unknown',
+      monitorPowWaiting: 'Waiting for trigger',
+      monitorPowTip: 'Lower PoW difficulty is faster (green is best)',
+      monitorIpTip: 'IP quality is based on Scamalytics fraud score',
+      monitorServiceTip: 'Official status from status.openai.com',
+      monitorOpenStatus: 'Open status page',
+      monitorCopyHistory: 'Click to copy history',
+      monitorCopyHint: 'Click to copy the most recent 10 records',
+      monitorCopied: 'Copied',
+      monitorCopyFailed: 'Copy failed',
+      logExport: 'Export Logs',
+      logExportTip: 'Download diagnostic logs (txt)',
+      logExported: 'Exported',
+      moodTitle: 'Mood',
+      moodTip: 'Click to refresh',
+      moodSub: 'A gentle line for you',
+      riskVeryEasy: 'Very Easy',
+      riskEasy: 'Easy',
+      riskMedium: 'Medium',
+      riskHard: 'Hard',
+      riskCritical: 'Critical',
+      riskUnknown: 'Unknown'
+    }
+  };
+
+  function t(k) {
+    return (I18N[lang] && I18N[lang][k]) ? I18N[lang][k] : k;
+  }
+  // endregion: I18N & Labels
+
+  // region: Storage Keys & DOM IDs
+  // ========================== 持久化 Key ==========================
+  const KEY_MODE = 'cgpt_vs_mode';
+  const KEY_ENABLED = 'cgpt_vs_enabled';
+  const KEY_PINNED = 'cgpt_vs_pinned';
+  const KEY_POS = 'cgpt_vs_pos';
+  const KEY_LAST_OPEN = 'cgpt_vs_open';
+  const KEY_CHAT_PAUSE = 'cgpt_vs_pause_on_chat';
+  const KEY_IP_LOGS = 'cgpt_glass_ip_logs';
+
+  // ========================== DOM IDs ==========================
+  const STYLE_ID = 'cgpt-vs-style';
+  const ROOT_ID = 'cgpt-vs-root';
+  const DOT_ID = 'cgpt-vs-dot';
+  const BTN_ID = 'cgpt-vs-btn';
+  const STATUS_PILL_ID = 'cgpt-vs-statusPill';
+  const PANEL_ID = 'cgpt-vs-panel';
+  const STATUS_TEXT_ID = 'cgpt-vs-statusText';
+  const STATUS_REASON_ID = 'cgpt-vs-statusReason';
+  const TOP_TAGS_ID = 'cgpt-vs-topTags';
+  const TOP_SVC_TAG_ID = 'cgpt-vs-topSvc';
+  const TOP_IP_TAG_ID = 'cgpt-vs-topIp';
+  const TOP_POW_TAG_ID = 'cgpt-vs-topPow';
+  const TOP_PAUSE_TAG_ID = 'cgpt-vs-topPause';
+  const TOP_OPT_TAG_ID = 'cgpt-vs-topOpt';
+  const OPTIMIZE_BTN_ID = 'cgpt-vs-optimize';
+  const HELP_ID = 'cgpt-vs-help';
+  const AUTO_PAUSE_BTN_ID = 'cgpt-vs-autoPause';
+  const SCROLL_LATEST_BTN_ID = 'cgpt-vs-scrollLatest';
+  const LOG_EXPORT_BTN_ID = 'cgpt-vs-log-export';
+  const DEG_SECTION_ID = 'cgpt-vs-degrade';
+  const DEG_REFRESH_BTN_ID = 'cgpt-vs-deg-refresh';
+  const DEG_SERVICE_DESC_ID = 'cgpt-vs-deg-service-desc';
+  const DEG_SERVICE_TAG_ID = 'cgpt-vs-deg-service-tag';
+  const DEG_IP_VALUE_ID = 'cgpt-vs-deg-ip';
+  const DEG_IP_TAG_ID = 'cgpt-vs-deg-ip-tag';
+  const DEG_IP_BADGE_ID = 'cgpt-vs-deg-ip-badge';
+  const DEG_POW_VALUE_ID = 'cgpt-vs-deg-pow';
+  const DEG_POW_TAG_ID = 'cgpt-vs-deg-pow-tag';
+  const DEG_POW_BAR_ID = 'cgpt-vs-deg-pow-bar';
+  const FETCH_WRAP_KEY = '__CGPT_GLASS_FETCH_WRAPPED__';
+  const XHR_WRAP_KEY = '__CGPT_GLASS_XHR_WRAPPED__';
+  const DEG_IP_CLICK_KEY = '__cgpt_glass_ip_click__';
+  const MOOD_SECTION_ID = 'cgpt-vs-mood';
+  const MOOD_TEXT_ID = 'cgpt-vs-mood-text';
+  const MOOD_SUB_ID = 'cgpt-vs-mood-sub';
+
+  // Feature Pack 容器
+  const FP_ID = 'cgpt-vs-featurepack';
+  // endregion: Storage Keys & DOM IDs
+
+  // region: Runtime State
+  // ========================== 状态 ==========================
+  let currentMode = loadMode();
+  let virtualizationEnabled = loadBool(KEY_ENABLED, true);
+  let pinned = loadBool(KEY_PINNED, false);
+  let wasOpen = RESTORE_LAST_OPEN ? loadBool(KEY_LAST_OPEN, false) : false;
+  let autoPauseOnChat = loadBool(KEY_CHAT_PAUSE, true);
+  let chatBusy = false;
+  let chatBusyAt = 0;
+  let chatBusySeenAt = 0;
+
+  let ctrlFFreeze = false;
+  let typingDimTimer = null;
+  let lastInputAt = 0;
+
+  let rafPending = false;
+  let lastVirtualizedCount = 0;
+  let lastTurnsCount = 0;
+
+  let followTimer = null;
+  let docClickHandler = null;
+  let themeObserver = null;
+  let themeObservedBody = null;
+  let pinnedPos = loadPos();
+  let useSoftVirtualization = SUPPORTS_CV;
+  let hardActive = false;
+  let hardActiveSource = '';
+  let autoHardBelowAt = 0;
+  let lastHardPassAt = 0;
+  let lastAutoHardAt = 0;
+  let softSlimCount = 0;
+  let softObserved = new Set();
+  let softObserver = null;
+  let softObserverMargin = '';
+  let softObserverRoot = null;
+  let softSyncTimer = null;
+  let softSyncPending = false;
+  let softSyncDeferred = false;
+  let msgObserver = null;
+  let msgContainer = null;
+  let scrollRoot = null;
+  let scrollRootAt = 0;
+  let scrollTarget = window;
+  let scrollRootIsWindow = true;
+  let lastScrollAt = 0;
+  let lastScrollTop = 0;
+  let hardScrollDeferAt = 0;
+  let hardScrollIdleTimer = 0;
+  let globalScrollHookInstalled = false;
+  let msgCache = [];
+  let msgCacheDirty = true;
+  let msgCacheAt = 0;
+  let domCountCache = 0;
+  let domCountAt = 0;
+  let turnsCountCache = 0;
+  let turnsCountAt = 0;
+  let optimizeBusyUntil = 0;
+  let optimizeState = {
+    active: false,
+    lastWorkAt: 0
+  };
+  let optimizeGateReady = null;
+  let lastUiFullAt = 0;
+  let deferredFullUiScheduled = false;
+  let uiCache = {
+    at: 0,
+    domNodes: 0,
+    usedMB: null,
+    turns: 0,
+    plan: null
+  };
+  let tokenState = {
+    nextAt: 0,
+    pending: false,
+    value: 0,
+    timer: 0,
+    instance: 0
+  };
+  let moodState = {
+    index: -1,
+    nextAt: 0,
+    seed: 0,
+    inFlight: false
+  };
+  let marginCache = {
+    at: 0,
+    soft: MODE_TO_SOFT_MARGIN_SCREENS[currentMode] ?? MODE_TO_SOFT_MARGIN_SCREENS.balanced,
+    hard: MODE_TO_HARD_MARGIN_SCREENS[currentMode] ?? MODE_TO_HARD_MARGIN_SCREENS.balanced,
+    turns: 0,
+    mode: currentMode,
+    overrideUntil: 0,
+    overrideReason: ''
+  };
+  let modelBtnCache = {
+    el: null,
+    at: 0
+  };
+
+  // ========================== 服务降级监控状态 ==========================
+  let degradedState = {
+    service: {
+      indicator: 'none',
+      description: '',
+      color: '#10a37f',
+      updatedAt: 0
+    },
+    ip: {
+      masked: '--',
+      full: '',
+      warp: 'off',
+      qualityLabel: '',
+      qualityShort: '',
+      qualityProbability: '',
+      qualityColor: '#9ca3af',
+      qualityScore: null,
+      qualityTooltip: '',
+      historyTooltip: '',
+      updatedAt: 0,
+      qualityAt: 0,
+      qualityIp: '',
+      inFlight: false,
+      lastFetchAt: 0,
+      error: ''
+    },
+    pow: {
+      difficulty: '',
+      levelLabel: '',
+      levelKey: 'riskUnknown',
+      color: '#9ca3af',
+      percentage: 0,
+      updatedAt: 0,
+      lastProbeAt: 0
+    },
+    user: {
+      type: '',
+      paid: null
+    }
+  };
+  let degradedTimers = {
+    fetchMonitor: 0,
+    status: 0,
+    ip: 0
+  };
+  let degradedStarted = false;
+  let hardSliceState = {
+    active: false,
+    token: 0,
+    index: 0,
+    total: 0,
+    startAt: 0,
+    scrollTop: 0,
+    viewportH: 0,
+    steps: 0,
+    lastStepAt: 0
+  };
+  // endregion: Runtime State
+
+  // region: Logging & Diagnostics
+  // ========================== 诊断日志（控制台输出） ==========================
+  const LOG_KEY = 'cgpt_vs_log_level';
+  const LOG_CONSOLE_KEY = 'cgpt_vs_log_console';
+  const LOG_ENV_KEY = 'cgpt_vs_log_env';
+  const LOG_BUFFER_MAX = 600;
+  const LOG_VIRT_THROTTLE_MS = 3500;
+  const LOG_HEALTH_THROTTLE_MS = 6000;
+  const LOG_SCHEMA_VERSION = '1.1';
+  const LOG_SOURCE = 'cgpt_glass_engine';
+  const LOG_COMPONENT = 'userscript';
+  // Note: In Node/server environments, prefer Winston/Pino/Bunyan for structured logs.
+  const LOG_FIELD_ORDER = [
+    'timestamp',
+    'level',
+    'message',
+    'context',
+    'severity',
+    'event',
+    'event_id',
+    'category',
+    'outcome',
+    'source',
+    'component',
+    'session_id',
+    'version',
+    'seq'
+  ];
+  const LOG_EVENT_CATEGORY = {
+    degraded: 'degradation',
+    virtualize: 'virtualization',
+    soft: 'virtualization',
+    hard: 'virtualization',
+    optimize: 'virtualization',
+    health: 'health',
+    ui: 'ui',
+    route: 'routing',
+    resize: 'ui',
+    boot: 'lifecycle',
+    chat: 'interaction',
+    ctrlF: 'interaction',
+    log: 'logging',
+    window: 'runtime'
+  };
+  const LOG_OUTCOME_FAIL_RE = /(?:^|[._-])(fail|error|timeout|reject|denied|invalid)(?:$|[._-])/i;
+  const SENSITIVE_KEY_RE = /pass(word)?|token|secret|authorization|cookie|session|bearer|api[-_]?key/i;
+  const IP_KEY_RE = /\bip\b/i;
+
+  const LOG_LEVELS = {
+    off: 0,
+    info: 1,
+    warn: 1,
+    error: 1,
+    debug: 2
+  };
+
+  const LOG_ENV = (() => {
+    try {
+      const raw = localStorage.getItem(LOG_ENV_KEY);
+      if (raw === 'dev' || raw === 'prod') return raw;
+    }
+    catch {}
+    return 'prod';
+  })();
+  const IS_PROD = LOG_ENV === 'prod';
+
+  let logLevel = localStorage.getItem(LOG_KEY) || 'info';
+  if (!LOG_LEVELS[logLevel]) logLevel = 'info';
+  if (IS_PROD && logLevel === 'debug') logLevel = 'info';
+  let logToConsole = localStorage.getItem(LOG_CONSOLE_KEY);
+  if (logToConsole == null) logToConsole = '0';
+  logToConsole = logToConsole === '1';
+
+  const logBuffer = [];
+  let logSeq = 0;
+  let lastVirtSig = '';
+  let lastVirtLogAt = 0;
+  let lastHealthSig = '';
+  let lastHealthLogAt = 0;
+
+  function canLog(level) {
+    if (IS_PROD && level === 'debug') return false;
+    const target = LOG_LEVELS[level] ?? LOG_LEVELS.info;
+    const current = LOG_LEVELS[logLevel] ?? LOG_LEVELS.info;
+    return target <= current;
+  }
+
+  function markMarginCacheDirty() {
+    marginCache.at = 0;
+    marginCache.overrideUntil = 0;
+    marginCache.overrideReason = '';
+  }
+
+  function markMsgCacheDirty() {
+    msgCacheDirty = true;
+    msgCacheAt = 0;
+    turnsCountAt = 0;
+    markMarginCacheDirty();
+  }
+
+  function getDomNodeCount() {
+    const now = Date.now();
+    if (!domCountAt || (now - domCountAt) > DOM_COUNT_TTL_MS) {
+      domCountCache = document.getElementsByTagName('*').length;
+      domCountAt = now;
+    }
+    return domCountCache;
+  }
+
+  function getTurnsCountCached(force) {
+    const now = Date.now();
+    if (!force && turnsCountAt && (now - turnsCountAt) < TURNS_COUNT_TTL_MS && turnsCountCache) {
+      return turnsCountCache;
+    }
+    const nodes = getMessageNodes();
+    const count = nodes ? nodes.length : 0;
+    turnsCountCache = count;
+    turnsCountAt = now;
+    return count;
+  }
+
+  function isScrollable(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    const style = getComputedStyle(el);
+    const overflowY = style.overflowY || style.overflow;
+    if (!overflowY || (overflowY !== 'auto' && overflowY !== 'scroll' && overflowY !== 'overlay')) return false;
+    return (el.scrollHeight - el.clientHeight) > 24;
+  }
+
+  function resolveScrollRoot() {
+    const now = Date.now();
+    if (scrollRoot && (now - scrollRootAt) < SCROLL_ROOT_TTL_MS) return scrollRoot;
+    scrollRootAt = now;
+    let base = msgContainer || findMessageContainer();
+    let el = base;
+    while (el && el !== document.body && el !== document.documentElement) {
+      if (isScrollable(el)) {
+        scrollRoot = el;
+        return scrollRoot;
+      }
+      el = el.parentElement;
+    }
+    scrollRoot = document.scrollingElement || document.documentElement || document.body;
+    return scrollRoot;
+  }
+
+  function getScrollMetrics() {
+    const root = resolveScrollRoot();
+    const isWindowRoot = !root ||
+      root === document.scrollingElement ||
+      root === document.documentElement ||
+      root === document.body;
+    scrollRootIsWindow = isWindowRoot;
+    return {
+      root,
+      isWindow: isWindowRoot,
+      top: isWindowRoot ? Math.round(window.scrollY) : Math.round(root.scrollTop || 0),
+      height: isWindowRoot ? Math.round(window.innerHeight) : Math.round(root.clientHeight || 0)
+    };
+  }
+
+  function handleScroll(e) {
+    const target = e?.target;
+    if (target && target !== document && target !== document.documentElement && target !== document.body && target.nodeType === 1) {
+      if (scrollRoot !== target) scrollRoot = target;
+      scrollRootAt = Date.now();
+      scrollRootIsWindow = false;
+      if (scrollTarget !== target) {
+        if (scrollTarget) scrollTarget.removeEventListener('scroll', handleScroll, {
+          passive: true
+        });
+        scrollTarget = target;
+        scrollTarget.addEventListener('scroll', handleScroll, {
+          passive: true
+        });
+      }
+    }
+    else if (target) {
+      scrollRoot = document.scrollingElement || document.documentElement || document.body;
+      scrollRootAt = Date.now();
+      scrollRootIsWindow = true;
+      if (scrollTarget !== window) {
+        if (scrollTarget) scrollTarget.removeEventListener('scroll', handleScroll, {
+          passive: true
+        });
+        scrollTarget = window;
+        scrollTarget.addEventListener('scroll', handleScroll, {
+          passive: true
+        });
+      }
+    }
+    const scrollInfo = getScrollMetrics();
+    lastScrollAt = Date.now();
+    lastScrollTop = scrollInfo.top;
+    scheduleVirtualize();
+  }
+
+  function installGlobalScrollHook() {
+    if (globalScrollHookInstalled) return;
+    globalScrollHookInstalled = true;
+    document.addEventListener('scroll', handleScroll, {
+      capture: true,
+      passive: true
+    });
+  }
+
+  function installScrollHook() {
+    installGlobalScrollHook();
+    const info = getScrollMetrics();
+    const target = info.isWindow ? window : info.root;
+    if (scrollTarget === target) return;
+    if (scrollTarget) scrollTarget.removeEventListener('scroll', handleScroll, {
+      passive: true
+    });
+    scrollTarget = target;
+    scrollRoot = info.root;
+    scrollRootIsWindow = info.isWindow;
+    if (scrollTarget) scrollTarget.addEventListener('scroll', handleScroll, {
+      passive: true
+    });
+  }
+
+  function isChatBusy() {
+    const fastHit = document.querySelector(
+      'button[aria-label*="Stop"], button[aria-label*="停止"], button[title*="Stop"], button[title*="停止"], button[aria-label*="Stop generating"], button[aria-label*="停止生成"], [data-testid="stop-generating"], [data-testid*="stop"]'
+    );
+    if (fastHit) return true;
+
+    const streamingHit = document.querySelector(
+      '.result-streaming, [data-message-author-role="assistant"][data-streaming="true"], [data-message-author-role="assistant"][data-is-streaming="true"], [data-testid="message-streaming"], [data-message-status="in_progress"], [data-message-status="streaming"], [data-message-status="pending"], [data-message-status="running"], [data-message-status="incomplete"]'
+    );
+    if (streamingHit) return true;
+
+    const btns = document.querySelectorAll('button, [role="button"]');
+    const limit = Math.min(btns.length, CHAT_BUSY_MAX_SCAN);
+    for (let i = 0; i < limit; i += 1) {
+      const b = btns[i];
+      const label = (b.getAttribute('aria-label') || b.getAttribute('title') || '').trim();
+      const text = ((b.textContent || '')).trim();
+      const txt = label || text;
+      if (!txt) continue;
+      if (
+        txt === 'Stop' ||
+        txt === '停止' ||
+        txt.includes('Stop generating') ||
+        txt.includes('停止生成') ||
+        txt.includes('停止回复') ||
+        txt.includes('停止回答')
+      ) return true;
+    }
+    return false;
+  }
+
+  function updateChatBusy(force) {
+    if (!autoPauseOnChat) {
+      chatBusy = false;
+      chatBusySeenAt = 0;
+      return false;
+    }
+    const now = Date.now();
+    if (!force && (now - chatBusyAt) < CHAT_BUSY_TTL_MS) return chatBusy;
+    const prev = chatBusy;
+    const busyNow = isChatBusy();
+    if (busyNow) chatBusySeenAt = now;
+    if (prev && !chatBusySeenAt) chatBusySeenAt = now;
+    const keepBusy = busyNow || (prev && (now - chatBusySeenAt) < CHAT_BUSY_GRACE_MS);
+    chatBusy = keepBusy;
+    chatBusyAt = now;
+    if (chatBusy !== prev) {
+      logEvent('info', chatBusy ? 'chat.pause' : 'chat.resume', {
+        autoPauseOnChat: !!autoPauseOnChat
+      });
+      if (!chatBusy) {
+        if (softSyncDeferred) {
+          softSyncDeferred = false;
+          scheduleSoftSync('chat.resume');
+        }
+        scheduleVirtualize();
+      }
+    }
+    return chatBusy;
+  }
+
+  function setOptimizeActive(active) {
+    optimizeState.active = !!active;
+    optimizeState.lastWorkAt = Date.now();
+  }
+
+  function markOptimizeWork() {
+    optimizeState.lastWorkAt = Date.now();
+  }
+
+  function isOptimizingNow() {
+    if (!virtualizationEnabled || ctrlFFreeze || (autoPauseOnChat && chatBusy)) return false;
+    const now = Date.now();
+    if (hardSliceState.active && hardSliceState.lastStepAt && (now - hardSliceState.lastStepAt) > OPTIMIZE_IDLE_CLEAR_MS) {
+      hardSliceState.active = false;
+      optimizeState.active = false;
+    }
+    if (hardSliceState.active || optimizeState.active) {
+      optimizeBusyUntil = now + OPTIMIZE_HOLD_MS;
+      return true;
+    }
+    return now < optimizeBusyUntil || (optimizeState.lastWorkAt && (now - optimizeState.lastWorkAt) < OPTIMIZE_HOLD_MS);
+  }
+
+  function pushLog(entry) {
+    logBuffer.push(entry);
+    if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
+  }
+
+  function hashString32(text) {
+    let hash = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      hash = ((hash << 5) - hash) + text.charCodeAt(i);
+      hash |= 0;
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function getEventId(eventName) {
+    const name = String(eventName || '').trim();
+    if (!name) return 'evt_0';
+    return `evt_${hashString32(name)}`;
+  }
+
+  function getEventCategory(eventName) {
+    const head = String(eventName || '').split('.')[0];
+    return LOG_EVENT_CATEGORY[head] || 'system';
+  }
+
+  function getEventOutcome(eventName, data, level) {
+    if (data && typeof data.success === 'boolean') return data.success ? 'success' : 'failure';
+    const name = String(eventName || '').toLowerCase();
+    if (LOG_OUTCOME_FAIL_RE.test(name)) return 'failure';
+    if (level === 'error') return 'failure';
+    if (level === 'warn') return 'unknown';
+    return 'success';
+  }
+
+  function getEventSeverity(level) {
+    if (level === 'error') return 'high';
+    if (level === 'warn') return 'medium';
+    if (level === 'info') return 'low';
+    return 'low';
+  }
+
+  function sanitizeContext(value) {
+    const seen = new WeakSet();
+    const redactIfNeeded = (key) => (key && SENSITIVE_KEY_RE.test(key) ? '[REDACTED]' : null);
+    const sanitizeValue = (val, keyHint) => {
+      if (val == null) return val;
+      if (typeof val === 'string') {
+        if (keyHint && IP_KEY_RE.test(keyHint)) return maskIP(val);
+        return val;
+      }
+      if (typeof val === 'bigint') return val.toString();
+      if (typeof val === 'function') return '[Function]';
+      if (typeof val === 'symbol') return '[Symbol]';
+      if (typeof val !== 'object') return val;
+      if (val instanceof Error) {
+        return {
+          name: val.name,
+          message: val.message,
+          stack: IS_PROD ? undefined : val.stack
+        };
+      }
+      if (seen.has(val)) return '[Circular]';
+      seen.add(val);
+      if (Array.isArray(val)) return val.map((item) => sanitizeValue(item, keyHint));
+      const out = {};
+      Object.keys(val).forEach((k) => {
+        const redacted = redactIfNeeded(k);
+        if (redacted) {
+          out[k] = redacted;
+        }
+        else {
+          out[k] = sanitizeValue(val[k], k);
+        }
+      });
+      return out;
+    };
+    return sanitizeValue(value, '');
+  }
+
+  function logEvent(level, event, data) {
+    const safeLevel = LOG_LEVELS[level] ? level : 'info';
+    if (!canLog(safeLevel)) return;
+    const eventName = String(event || '').trim() || 'event';
+    const timestamp = new Date().toISOString();
+    const context = sanitizeContext(data);
+    const entry = {
+      seq: ++logSeq,
+      timestamp,
+      level: safeLevel,
+      message: eventName,
+      context,
+      severity: getEventSeverity(safeLevel),
+      event: eventName,
+      eventId: getEventId(eventName),
+      category: getEventCategory(eventName),
+      outcome: getEventOutcome(eventName, data, safeLevel),
+      source: LOG_SOURCE,
+      component: LOG_COMPONENT,
+      sessionId: SESSION_ID,
+      version: SCRIPT_VERSION,
+      data: data ?? null
+    };
+    pushLog(entry);
+
+    if (logToConsole) {
+      const fn = (safeLevel === 'warn') ? 'warn' : (safeLevel === 'error') ? 'error' : 'log';
+      console[fn](formatLogLine(entry));
+    }
+  }
+
+  function setLogLevel(level) {
+    let next = LOG_LEVELS[level] ? level : 'info';
+    if (IS_PROD && next === 'debug') next = 'info';
+    logLevel = next;
+    localStorage.setItem(LOG_KEY, next);
+    logEvent('info', 'logLevel', {
+      level: next,
+      note: 'Use CGPT_VS.exportLogs() or the panel button to export logs.'
+    });
+  }
+
+  function setLogConsole(enabled) {
+    logToConsole = !!enabled;
+    localStorage.setItem(LOG_CONSOLE_KEY, logToConsole ? '1' : '0');
+    logEvent('info', 'logConsole', {
+      enabled: logToConsole
+    });
+  }
+
+  function setChatPause(enabled) {
+    autoPauseOnChat = !!enabled;
+    saveBool(KEY_CHAT_PAUSE, autoPauseOnChat);
+    if (!autoPauseOnChat) chatBusy = false;
+    logEvent('info', 'chat.pauseMode', {
+      enabled: autoPauseOnChat
+    });
+    scheduleVirtualize();
+    updateUI();
+  }
+
+  function getPauseReason() {
+    if (!virtualizationEnabled) return 'manual';
+    if (ctrlFFreeze) return 'find';
+    if (autoPauseOnChat && chatBusy) return 'chat';
+    return '';
+  }
+
+  function pauseReasonLabel(reason) {
+    if (reason === 'chat') return t('pauseByChat');
+    if (reason === 'find') return t('pauseByFind');
+    if (reason === 'manual') return t('pauseByManual');
+    return '';
+  }
+
+  function pauseReasonText(reason) {
+    if (reason === 'chat') {
+      return lang === 'zh'
+        ? '回复生成中：已自动暂停优化以避免干扰。'
+        : 'Assistant replying: optimization is paused to avoid interference.';
+    }
+    if (reason === 'find') {
+      return lang === 'zh'
+        ? 'Ctrl+F 搜索中：已暂停以保证能搜到所有历史。'
+        : 'Find (Ctrl+F) is active: paused so all history is searchable.';
+    }
+    if (reason === 'manual') {
+      return lang === 'zh'
+        ? '已手动暂停：完整显示历史，但更容易卡顿。'
+        : 'Manual pause: full history is visible, but it may be heavier.';
+    }
+    return lang === 'zh'
+      ? '状态由性能与服务/IP/PoW 综合评估。'
+      : 'Status combines performance with service/IP/PoW signals.';
+  }
+
+  function getStateSnapshot() {
+    updateChatBusy(false);
+    const domNodes = getDomNodeCount();
+    const usedMB = getUsedHeapMB();
+    const scrollInfo = getScrollMetrics();
+    const degraded = getDegradedHealth();
+    const pauseReason = getPauseReason();
+    const virtMode = (hardActive || !useSoftVirtualization) ? 'hard' : 'soft';
+    return {
+      version: SCRIPT_VERSION,
+      url: location.href,
+      lang,
+      mode: currentMode,
+      virtualizationEnabled,
+      pinned,
+      ctrlFFreeze,
+      pausedReason: pauseReason || '',
+      paused: !!pauseReason,
+      turns: lastTurnsCount || 0,
+      virtualized: lastVirtualizedCount || 0,
+      domNodes,
+      memMB: usedMB == null ? null : Number(usedMB.toFixed(1)),
+      scrollY: Math.round(scrollInfo.top),
+      viewportH: Math.round(scrollInfo.height),
+      logLevel,
+      logToConsole,
+      virtualizationMode: virtMode,
+      hardActive,
+      hardActiveSource: hardActiveSource || '',
+      autoPauseOnChat,
+      chatBusy: !!chatBusy,
+      degradedSeverity: degraded.severity,
+      degradedServiceIndicator: degradedState.service.indicator,
+      degradedServiceDesc: degradedState.service.description,
+      degradedIp: degradedState.ip.masked,
+      degradedIpScore: degradedState.ip.qualityScore,
+      degradedPowDifficulty: degradedState.pow.difficulty,
+      degradedPowLevel: degradedState.pow.levelLabel,
+      scrollRoot: scrollRootIsWindow ? 'window' : (scrollRoot && scrollRoot.tagName ? scrollRoot.tagName.toLowerCase() : 'element')
+    };
+  }
+
+  function pad2(n) {
+    return String(n).padStart(2, '0');
+  }
+
+  function getLocalDateKey(date) {
+    const d = date instanceof Date ? date : new Date();
+    const yyyy = d.getFullYear();
+    const mm = pad2(d.getMonth() + 1);
+    const dd = pad2(d.getDate());
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function getNextLocalMidnightMs() {
+    const d = new Date();
+    d.setHours(24, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function formatLocalTimestamp(date) {
+    const d = date instanceof Date ? date : new Date();
+    const yyyy = d.getFullYear();
+    const mm = pad2(d.getMonth() + 1);
+    const dd = pad2(d.getDate());
+    const hh = pad2(d.getHours());
+    const mi = pad2(d.getMinutes());
+    const ss = pad2(d.getSeconds());
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+  }
+
+  function formatFileTimestamp(date) {
+    const d = date instanceof Date ? date : new Date();
+    const yyyy = d.getFullYear();
+    const mm = pad2(d.getMonth() + 1);
+    const dd = pad2(d.getDate());
+    const hh = pad2(d.getHours());
+    const mi = pad2(d.getMinutes());
+    const ss = pad2(d.getSeconds());
+    return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
+  }
+
+  function safeJsonStringify(value) {
+    try {
+      const json = JSON.stringify(value);
+      if (json === undefined) return String(value);
+      return json;
+    }
+    catch {
+      try {
+        return String(value);
+      }
+      catch {
+        return '[unserializable]';
+      }
+    }
+  }
+
+  function formatLogValue(value) {
+    if (value == null) return '';
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    let text = (typeof value === 'string') ? value : safeJsonStringify(value);
+    if (text == null) return '';
+    text = String(text).replace(/\r?\n/g, '\\n');
+    if (!text) return "''";
+    const needsQuote = /[\\s=]/.test(text) || text.includes('"') || text.includes("'");
+    if (!needsQuote) return text;
+    const escaped = text.replace(/'/g, "'\\''");
+    return `'${escaped}'`;
+  }
+
+  function formatLogLine(entry) {
+    const payload = {
+      timestamp: entry.timestamp,
+      level: entry.level,
+      message: entry.message,
+      context: entry.context ?? null,
+      severity: entry.severity,
+      event: entry.event,
+      event_id: entry.eventId,
+      category: entry.category,
+      outcome: entry.outcome,
+      source: entry.source,
+      component: entry.component,
+      session_id: entry.sessionId,
+      version: entry.version,
+      seq: entry.seq
+    };
+    return JSON.stringify(payload);
+  }
+
+  function formatDurationMs(ms) {
+    if (!isFinite(ms) || ms < 0) return 'n/a';
+    const total = Math.floor(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}h${pad2(m)}m${pad2(s)}s`;
+    return `${m}m${pad2(s)}s`;
+  }
+
+  function formatAge(ts) {
+    if (!ts) return 'n/a';
+    const age = Date.now() - ts;
+    return `${formatLocalTimestamp(new Date(ts))} (${formatDurationMs(age)})`;
+  }
+
+  function describeEl(el) {
+    if (!el) return 'n/a';
+    if (el === window) return 'window';
+    if (el === document) return 'document';
+    if (el === document.body) return 'body';
+    if (el === document.documentElement) return 'html';
+    const tag = (el.tagName || '').toLowerCase() || 'element';
+    const id = el.id ? `#${el.id}` : '';
+    return `${tag}${id}`;
+  }
+
+  function severityTag(level) {
+    if (level === 'bad') return 'BAD';
+    if (level === 'warn') return 'WARN';
+    if (level === 'ok') return 'OK';
+    return 'SUSPECT';
+  }
+
+  function formatTaggedLine(label, level, value, note) {
+    const tag = severityTag(level);
+    const detail = value == null || value === '' ? '--' : String(value);
+    const extra = note ? ` | ${note}` : '';
+    return `[${tag}] ${label}: ${detail}${extra}`;
+  }
+
+  // ========================== Service/IP/PoW Session Cache ==========================
+  function getStaleHint(ts) {
+    if (!ts) return lang === 'zh' ? '缓存: 无时间' : 'cache: unknown';
+    const age = formatDurationMs(Date.now() - ts);
+    return lang === 'zh' ? `缓存: ${age}` : `cache: ${age}`;
+  }
+
+  function getStorageSafe(kind) {
+    try {
+      if (kind === 'local' && typeof localStorage !== 'undefined') return localStorage;
+      if (kind === 'session' && typeof sessionStorage !== 'undefined') return sessionStorage;
+    }
+    catch {}
+    return null;
+  }
+
+  function readDegradedCacheFrom(storage) {
+    if (!storage) return null;
+    try {
+      const raw = storage.getItem(DEG_CACHE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || data.v !== DEG_CACHE_VERSION) return null;
+      if (data.savedAt && (Date.now() - data.savedAt) > DEG_CACHE_MAX_AGE_MS) return null;
+      return data;
+    }
+    catch {
+      return null;
+    }
+  }
+
+  function loadDegradedCache() {
+    const localStore = getStorageSafe('local');
+    const sessionStore = getStorageSafe('session');
+    const local = readDegradedCacheFrom(localStore);
+    if (local) return local;
+    const session = readDegradedCacheFrom(sessionStore);
+    if (session && localStore) {
+      try {
+        localStore.setItem(DEG_CACHE_KEY, JSON.stringify(session));
+      }
+      catch {}
+    }
+    return session;
+  }
+
+  function saveDegradedCache() {
+    try {
+      const payload = {
+        v: DEG_CACHE_VERSION,
+        savedAt: Date.now(),
+        service: {
+          indicator: degradedState.service.indicator,
+          description: degradedState.service.description,
+          color: degradedState.service.color,
+          updatedAt: degradedState.service.updatedAt
+        },
+        ip: {
+          masked: degradedState.ip.masked,
+          full: degradedState.ip.full,
+          warp: degradedState.ip.warp,
+          qualityLabel: degradedState.ip.qualityLabel,
+          qualityShort: degradedState.ip.qualityShort,
+          qualityProbability: degradedState.ip.qualityProbability,
+          qualityColor: degradedState.ip.qualityColor,
+          qualityScore: degradedState.ip.qualityScore,
+          qualityTooltip: degradedState.ip.qualityTooltip,
+          historyTooltip: degradedState.ip.historyTooltip,
+          updatedAt: degradedState.ip.updatedAt,
+          qualityAt: degradedState.ip.qualityAt
+        },
+        pow: {
+          difficulty: degradedState.pow.difficulty,
+          levelLabel: degradedState.pow.levelLabel,
+          levelKey: degradedState.pow.levelKey,
+          color: degradedState.pow.color,
+          percentage: degradedState.pow.percentage,
+          updatedAt: degradedState.pow.updatedAt
+        },
+        user: {
+          type: degradedState.user.type,
+          paid: degradedState.user.paid
+        }
+      };
+      const localStore = getStorageSafe('local');
+      const sessionStore = getStorageSafe('session');
+      if (localStore) localStore.setItem(DEG_CACHE_KEY, JSON.stringify(payload));
+      if (sessionStore) sessionStore.setItem(DEG_CACHE_KEY, JSON.stringify(payload));
+    }
+    catch {}
+  }
+
+  function applyDegradedCache(cache) {
+    if (!cache) return false;
+    const svc = cache.service || {};
+    if (svc.indicator || svc.description) {
+      degradedState.service.indicator = svc.indicator || degradedState.service.indicator;
+      degradedState.service.description = svc.description || degradedState.service.description;
+      degradedState.service.color = svc.color || degradedState.service.color;
+      degradedState.service.updatedAt = svc.updatedAt || degradedState.service.updatedAt;
+    }
+
+    const ip = cache.ip || {};
+    if (ip.masked || ip.full || ip.qualityLabel) {
+      degradedState.ip.masked = ip.masked || degradedState.ip.masked;
+      degradedState.ip.full = ip.full || degradedState.ip.full;
+      degradedState.ip.warp = ip.warp || degradedState.ip.warp;
+      degradedState.ip.qualityLabel = ip.qualityLabel || degradedState.ip.qualityLabel;
+      degradedState.ip.qualityShort = ip.qualityShort || degradedState.ip.qualityShort;
+      degradedState.ip.qualityProbability = ip.qualityProbability || degradedState.ip.qualityProbability;
+      degradedState.ip.qualityColor = ip.qualityColor || degradedState.ip.qualityColor;
+      degradedState.ip.qualityScore = (ip.qualityScore == null) ? degradedState.ip.qualityScore : ip.qualityScore;
+      degradedState.ip.qualityTooltip = ip.qualityTooltip || degradedState.ip.qualityTooltip;
+      degradedState.ip.historyTooltip = ip.historyTooltip || degradedState.ip.historyTooltip;
+      degradedState.ip.updatedAt = ip.updatedAt || degradedState.ip.updatedAt;
+      degradedState.ip.qualityAt = ip.qualityAt || degradedState.ip.qualityAt;
+    }
+
+    const pow = cache.pow || {};
+    if (pow.difficulty || pow.levelLabel || pow.levelKey) {
+      degradedState.pow.difficulty = pow.difficulty || degradedState.pow.difficulty;
+      degradedState.pow.levelLabel = pow.levelLabel || degradedState.pow.levelLabel;
+      degradedState.pow.levelKey = pow.levelKey || degradedState.pow.levelKey;
+      degradedState.pow.color = pow.color || degradedState.pow.color;
+      degradedState.pow.percentage = (pow.percentage == null) ? degradedState.pow.percentage : pow.percentage;
+      degradedState.pow.updatedAt = pow.updatedAt || degradedState.pow.updatedAt;
+    }
+
+    const user = cache.user || {};
+    if (user.type) degradedState.user.type = user.type;
+    if (typeof user.paid === 'boolean') degradedState.user.paid = user.paid;
+    return true;
+  }
+
+  function buildLogExportText(reason) {
+    const now = new Date();
+    const nowMs = Date.now();
+    const state = getStateSnapshot();
+    const marginSnap = getDynamicMargins(true);
+    const scrollIdleMs = lastScrollAt ? Math.max(0, nowMs - lastScrollAt) : null;
+    const hardDeferMs = hardScrollDeferAt ? Math.max(0, nowMs - hardScrollDeferAt) : null;
+    const busyRemainingMs = optimizeBusyUntil && (optimizeBusyUntil > nowMs)
+      ? (optimizeBusyUntil - nowMs)
+      : 0;
+    const marginOverrideRemainingMs = marginSnap.overrideUntil && (marginSnap.overrideUntil > nowMs)
+      ? (marginSnap.overrideUntil - nowMs)
+      : 0;
+    const optimizingNow = (() => {
+      if (!virtualizationEnabled || ctrlFFreeze || (autoPauseOnChat && chatBusy)) return false;
+      if (hardSliceState.active || optimizeState.active) return true;
+      if (optimizeState.lastWorkAt && (nowMs - optimizeState.lastWorkAt) < OPTIMIZE_HOLD_MS) return true;
+      if (optimizeBusyUntil && nowMs < optimizeBusyUntil) return true;
+      return false;
+    })();
+    const entries = logBuffer.slice();
+    const counts = {
+      info: 0,
+      warn: 0,
+      error: 0,
+      debug: 0
+    };
+    entries.forEach((e) => {
+      const key = String(e.level || '').toLowerCase();
+      if (counts[key] != null) counts[key] += 1;
+    });
+
+    const memInfo = memoryLevel(state.memMB);
+    const domInfo = domLevel(state.domNodes);
+    const serviceFresh = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS);
+    const serviceInfo = getServiceIndicatorInfo(degradedState.service.indicator, degradedState.service.description);
+    const serviceSev = serviceFresh ? serviceInfo.severity : 'na';
+    const ipFresh = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS);
+    const ipInfo = getIpRiskInfo(degradedState.ip.qualityScore);
+    const ipSev = ipFresh ? ipInfo.severity : 'na';
+    // Keep last known PoW visible even if stale; gray color indicates staleness.
+    const powFresh = isFresh(degradedState.pow.updatedAt, DEG_POW_TTL_MS);
+    const powInfo = getPowRiskInfo(degradedState.pow.difficulty);
+    const powSev = powFresh ? powInfo.severity : 'na';
+    const virtSev = state.virtualizationEnabled ? 'ok' : 'warn';
+    const pauseSev = state.paused ? (state.pausedReason === 'manual' ? 'warn' : 'na') : 'ok';
+    const overallSev = maxSeverity([memInfo.level, domInfo.level, serviceSev, ipSev, powSev, virtSev, pauseSev]);
+    const firstEvent = entries.length ? entries[0].timestamp : '';
+    const lastEvent = entries.length ? entries[entries.length - 1].timestamp : '';
+
+    const lines = [];
+    lines.push('CGPT Glass Engine Log Export');
+    lines.push(`Generated: ${formatLocalTimestamp(now)} (${now.toISOString()})`);
+    lines.push(`SessionStart: ${formatLocalTimestamp(new Date(SESSION_STARTED_AT))} (${new Date(SESSION_STARTED_AT).toISOString()})`);
+    lines.push(`SessionAge: ${formatDurationMs(Date.now() - SESSION_STARTED_AT)}`);
+    lines.push('SessionScope: current page lifetime only (no persistence)');
+    if (reason) lines.push(`Reason: ${reason}`);
+    lines.push(`Version: ${state.version}`);
+    lines.push(`URL: ${state.url}`);
+    lines.push(`UserAgent: ${navigator.userAgent}`);
+    lines.push(`LogLevel: ${logLevel}`);
+    lines.push(`LogConsole: ${logToConsole ? 'on' : 'off'}`);
+    lines.push(`Entries: ${entries.length} (info:${counts.info} warn:${counts.warn} error:${counts.error} debug:${counts.debug})`);
+    if (firstEvent && lastEvent) lines.push(`EventsRange: ${firstEvent} -> ${lastEvent}`);
+    lines.push('');
+    lines.push('[LogSchema]');
+    lines.push(`schema_version=${LOG_SCHEMA_VERSION}`);
+    lines.push('format=json_line');
+    lines.push(`source=${LOG_SOURCE}`);
+    lines.push(`component=${LOG_COMPONENT}`);
+    lines.push(`session_id=${SESSION_ID}`);
+    lines.push(`host=${location.host || '--'}`);
+    lines.push(`tz_offset_min=${new Date().getTimezoneOffset()}`);
+    lines.push(`fields=${LOG_FIELD_ORDER.join(',')}`);
+    lines.push('');
+    lines.push('[Highlights]');
+    lines.push('Legend: [OK]=正常 [WARN]=存疑 [BAD]=异常 [SUSPECT]=数据缺失/过期');
+    lines.push(formatTaggedLine('Overall', overallSev, severityTag(overallSev), 'mem/dom/service/ip/pow/virt/pause'));
+    lines.push(formatTaggedLine('Memory', memInfo.level, memInfo.label));
+    lines.push(formatTaggedLine('DOM', domInfo.level, domInfo.label));
+    lines.push(formatTaggedLine('Service', serviceSev, `${serviceInfo.label} (${degradedState.service.indicator || '--'})`, serviceFresh ? 'fresh' : 'stale'));
+    lines.push(formatTaggedLine('IP', ipSev, `${degradedState.ip.masked || '--'} ${degradedState.ip.qualityLabel || ''}`.trim(), ipFresh ? 'fresh' : 'stale'));
+    lines.push(formatTaggedLine('PoW', powSev, `${degradedState.pow.difficulty || '--'} ${degradedState.pow.levelLabel || ''}`.trim(), powFresh ? 'fresh' : 'stale'));
+    lines.push(formatTaggedLine('Virtualization', virtSev, `${state.virtualizationEnabled ? 'on' : 'off'} (${state.virtualizationMode})`, state.paused ? `paused:${state.pausedReason || 'yes'}` : 'running'));
+    lines.push('');
+    lines.push('[State]');
+    lines.push(`mode=${state.mode} virt=${state.virtualizationEnabled ? 'on' : 'off'} soft=${useSoftVirtualization ? 'on' : 'off'} hardActive=${hardActive ? 'yes' : 'no'} hardSource=${state.hardActiveSource || 'n/a'}`);
+    lines.push(`paused=${state.paused ? (state.pausedReason || 'yes') : 'no'} autoPause=${state.autoPauseOnChat ? 'on' : 'off'} chatBusy=${state.chatBusy ? 'yes' : 'no'}`);
+    lines.push(`turns=${state.turns} virtualized=${state.virtualized}`);
+    lines.push(`domNodes=${state.domNodes} memMB=${state.memMB == null ? 'n/a' : state.memMB}`);
+    lines.push(`scrollY=${state.scrollY} viewportH=${state.viewportH} scrollRoot=${state.scrollRoot}`);
+    lines.push(`degraded=${state.degradedSeverity} service=${state.degradedServiceIndicator} (${state.degradedServiceDesc || '--'})`);
+    lines.push(`ip=${state.degradedIp || '--'} score=${state.degradedIpScore == null ? 'n/a' : state.degradedIpScore}`);
+    lines.push(`pow=${state.degradedPowDifficulty || '--'} (${state.degradedPowLevel || '--'})`);
+    lines.push('');
+    lines.push('[Instant]');
+    lines.push(`scroll.lastAt=${formatAge(lastScrollAt)} idleMs=${scrollIdleMs == null ? 'n/a' : Math.round(scrollIdleMs)} lastTop=${Math.round(lastScrollTop || 0)}`);
+    lines.push(`scroll.root=${describeEl(scrollRoot)} rootAt=${formatAge(scrollRootAt)} rootIsWindow=${scrollRootIsWindow ? 'yes' : 'no'} target=${describeEl(scrollTarget)}`);
+    lines.push(`hard.active=${hardActive ? 'yes' : 'no'} source=${hardActiveSource || 'n/a'} lastAutoHardAt=${formatAge(lastAutoHardAt)} autoHardBelowAt=${formatAge(autoHardBelowAt)}`);
+    lines.push(`hard.pass.lastAt=${formatAge(lastHardPassAt)} deferAt=${formatAge(hardScrollDeferAt)} deferAge=${hardDeferMs == null ? 'n/a' : formatDurationMs(hardDeferMs)} idleTimer=${hardScrollIdleTimer ? 'on' : 'off'}`);
+    lines.push(`hard.slice.active=${hardSliceState.active ? 'yes' : 'no'} steps=${hardSliceState.steps} index=${hardSliceState.index}/${hardSliceState.total} lastStepAt=${formatAge(hardSliceState.lastStepAt)} scrollTop=${Math.round(hardSliceState.scrollTop || 0)} viewportH=${Math.round(hardSliceState.viewportH || 0)}`);
+    lines.push(`soft.observed=${softObserved.size} slim=${softSlimCount} observerMargin=${softObserverMargin || '--'} observerRoot=${describeEl(softObserverRoot)}`);
+    lines.push(`soft.sync.pending=${softSyncPending ? 'yes' : 'no'} softTimer=${softSyncTimer ? 'on' : 'off'}`);
+    lines.push(`cache.msg.count=${msgCache.length} dirty=${msgCacheDirty ? 'yes' : 'no'} age=${msgCacheAt ? formatDurationMs(nowMs - msgCacheAt) : 'n/a'}`);
+    lines.push(`cache.turns.count=${turnsCountCache} age=${turnsCountAt ? formatDurationMs(nowMs - turnsCountAt) : 'n/a'} dom.age=${domCountAt ? formatDurationMs(nowMs - domCountAt) : 'n/a'}`);
+    lines.push(`opt.active=${optimizeState.active ? 'yes' : 'no'} optimizingNow=${optimizingNow ? 'yes' : 'no'} lastWorkAt=${formatAge(optimizeState.lastWorkAt)} busyUntil=${optimizeBusyUntil ? formatLocalTimestamp(new Date(optimizeBusyUntil)) : 'n/a'} busyRemaining=${formatDurationMs(busyRemainingMs)}`);
+    lines.push(`margins.soft=${marginSnap.soft} hard=${marginSnap.hard} desiredSoft=${marginSnap.desiredSoft} desiredHard=${marginSnap.desiredHard}`);
+    lines.push(`margins.autoHardDom=${marginSnap.autoHardDom} autoHardExit=${marginSnap.autoHardExit} override=${marginSnap.overrideUntil && nowMs < marginSnap.overrideUntil ? 'yes' : 'no'} overrideReason=${marginSnap.overrideReason || ''} overrideRemaining=${formatDurationMs(marginOverrideRemainingMs)}`);
+    lines.push('');
+    lines.push('[Events]');
+    if (!entries.length) {
+      lines.push('(empty)');
+    }
+    else {
+      entries.forEach((e) => lines.push(formatLogLine(e)));
+    }
+    return lines.join('\n');
+  }
+
+  function downloadTextFile(filename, text) {
+    try {
+      if (!document.body) throw new Error('document.body missing');
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.rel = 'noopener';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 0);
+    }
+    catch (err) {
+      logEvent('warn', 'log.export.fail', { message: err?.message || String(err) });
+    }
+  }
+
+  function exportLogsToFile(reason) {
+    logEvent('info', 'log.export', { reason: reason || 'manual', count: logBuffer.length });
+    const text = buildLogExportText(reason);
+    const filename = `cgpt-glass-log-${formatFileTimestamp(new Date())}.txt`;
+    downloadTextFile(filename, text);
+    return text;
+  }
+
+  function dumpLogs(reason) {
+    const text = buildLogExportText(reason);
+    if (logToConsole) console.log(text);
+    return text;
+  }
+
+  function clearAutoHard(reason, domNodes) {
+    if (!hardActive || hardActiveSource !== 'auto') return false;
+    const count = (typeof domNodes === 'number') ? domNodes : getDomNodeCount();
+    hardActive = false;
+    hardActiveSource = '';
+    autoHardBelowAt = 0;
+    logEvent('info', 'hard.auto.off', {
+      reason: reason || 'auto',
+      domNodes: count,
+      threshold: AUTO_HARD_EXIT_DOM
+    });
+    return true;
+  }
+  // endregion: Logging & Diagnostics
+
+  // region: Degradation Monitor (network + parsing)
+  // ========================== 服务降级监控：工具函数 ==========================
+  function gmRequestText(url, timeoutMs = DEG_REQ_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          timeout: timeoutMs,
+          onload: (r) => {
+            if (r.status >= 200 && r.status < 300) resolve(r.responseText);
+            else reject(new Error(`HTTP ${r.status}`));
+          },
+          onerror: (err) => reject(err instanceof Error ? err : new Error('Network error')),
+          ontimeout: () => reject(new Error('Request timed out'))
+        });
+        return;
+      }
+
+      // fallback: same-origin fetch (best effort)
+      fetch(url, { method: 'GET', credentials: 'omit' })
+        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then(resolve)
+        .catch(reject);
+    });
+  }
+
+  function parseJsonTextSafe(text) {
+    if (text == null) return null;
+    let raw = String(text).trim();
+    if (!raw) return null;
+    raw = raw.replace(/^\)\]\}',?\s*/, '');
+    const firstBrace = raw.indexOf('{');
+    const firstBracket = raw.indexOf('[');
+    let start = -1;
+    if (firstBrace >= 0 && firstBracket >= 0) start = Math.min(firstBrace, firstBracket);
+    else start = Math.max(firstBrace, firstBracket);
+    if (start > 0) raw = raw.slice(start);
+    try {
+      return JSON.parse(raw);
+    }
+    catch {
+      return null;
+    }
+  }
+
+  async function readJsonSafe(response) {
+    if (!response || typeof response.text !== 'function') return null;
+    try {
+      const text = await response.text();
+      return parseJsonTextSafe(text);
+    }
+    catch {
+      return null;
+    }
+  }
+
+  function isJsonContentType(contentType) {
+    const ct = String(contentType || '').toLowerCase();
+    return ct.includes('application/json') || ct.includes('+json');
+  }
+
+  function getResourceUrl(resource, response) {
+    if (resource && typeof resource === 'object' && typeof resource.url === 'string') return resource.url;
+    if (typeof resource === 'string') return resource;
+    if (response && typeof response.url === 'string') return response.url;
+    return '';
+  }
+
+  function parseTrace(text) {
+    const data = String(text || '').split('\n').reduce((acc, line) => {
+      const i = line.indexOf('=');
+      if (i <= 0) return acc;
+      const k = line.slice(0, i).trim();
+      const v = line.slice(i + 1).trim();
+      if (k) acc[k] = v;
+      return acc;
+    }, {});
+    return {
+      ip: data.ip || '',
+      warp: data.warp || 'off',
+      loc: data.loc || '',
+      colo: data.colo || ''
+    };
+  }
+
+  function maskIP(ip) {
+    if (!ip) return '--';
+    if (ip.includes(':')) {
+      const head = ip.slice(0, 6);
+      const tail = ip.slice(-4);
+      return `${head}…${tail}`;
+    }
+    const parts = ip.split('.');
+    if (parts.length !== 4) return ip;
+    return `${parts[0]}.${parts[1]}.*.*`;
+  }
+
+  function getIPLogs() {
+    try {
+      const raw = localStorage.getItem(KEY_IP_LOGS);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    }
+    catch {
+      return [];
+    }
+  }
+
+  function addIPLog(ip, score, difficulty) {
+    if (!ip) return [];
+    const logs = getIPLogs();
+    const entry = {
+      timestamp: new Date().toISOString(),
+      ip,
+      score: (score == null || Number.isNaN(Number(score))) ? null : Number(score),
+      difficulty: difficulty || 'N/A'
+    };
+    if (logs.length && logs[0].ip === ip) logs[0] = entry;
+    else logs.unshift(entry);
+    const trimmed = logs.slice(0, 10);
+    try {
+      localStorage.setItem(KEY_IP_LOGS, JSON.stringify(trimmed));
+    }
+    catch {}
+    return trimmed;
+  }
+
+  function formatIPLogs(logs) {
+    return logs.map((log) => {
+      const d = new Date(log.timestamp);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mi = String(d.getMinutes()).padStart(2, '0');
+      const scoreText = (log.score == null) ? 'N/A' : String(log.score);
+      const ipInfo = getIpRiskInfo(log.score);
+      const ipProb = ipInfo.probability ? ` ${ipInfo.probability}` : '';
+      const ipRiskText = `${ipInfo.label || t('riskUnknown')}${ipProb}`.trim();
+      const pow = log.difficulty || 'N/A';
+      const powInfo = getPowRiskInfo(pow);
+      const powLabel = powInfo.levelLabel || t('riskUnknown');
+      return `[${yyyy}-${mm}-${dd} ${hh}:${mi}] ${log.ip}(${scoreText}, ${ipRiskText}), ${pow}(${powLabel})`;
+    }).join('\n');
+  }
+
+  function normalizePowDifficulty(value) {
+    if (value == null) return '';
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (typeof value === 'string') return value.trim();
+    return '';
+  }
+
+  function isPowDifficultyLike(value) {
+    if (typeof value === 'number') return Number.isFinite(value);
+    if (typeof value !== 'string') return false;
+    const v = value.trim();
+    if (!v) return false;
+    if (/^0x[0-9a-f]+$/i.test(v)) return true;
+    if (/^[0-9a-f]{2,}$/i.test(v)) return true;
+    if (/^\d+$/.test(v)) return true;
+    return false;
+  }
+
+  function findPowDataInJson(root) {
+    const seen = new Set();
+    const stack = [{
+      value: root,
+      depth: 0,
+      hint: false
+    }];
+    let hasHint = false;
+
+    while (stack.length) {
+      const item = stack.pop();
+      const value = item?.value;
+      const depth = item?.depth || 0;
+      const hint = !!item?.hint;
+      if (!value || typeof value !== 'object') continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+
+      if (Array.isArray(value)) {
+        if (depth >= 6) continue;
+        value.forEach((v) => {
+          if (v && typeof v === 'object') stack.push({ value: v, depth: depth + 1, hint });
+        });
+        continue;
+      }
+
+      const entries = Object.entries(value);
+      for (const [key, val] of entries) {
+        const k = String(key || '').toLowerCase();
+        const keyHasPow = /pow|proof|work/.test(k);
+        const keyHasDiff = k.includes('difficulty');
+        if (keyHasPow) hasHint = true;
+
+        if (keyHasDiff && (hint || keyHasPow)) {
+          const cand = normalizePowDifficulty(val);
+          if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
+        }
+
+        if (keyHasPow && !keyHasDiff) {
+          const cand = normalizePowDifficulty(val);
+          if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
+        }
+
+        if (keyHasPow && val && typeof val === 'object') {
+          const direct =
+            val?.difficulty ??
+            val?.pow_difficulty ??
+            val?.powDifficulty ??
+            val?.proof_of_work_difficulty ??
+            val?.proofOfWorkDifficulty ??
+            null;
+          const cand = normalizePowDifficulty(direct);
+          if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
+        }
+
+        if (depth < 6 && val && typeof val === 'object') {
+          stack.push({ value: val, depth: depth + 1, hint: hint || keyHasPow });
+        }
+      }
+    }
+
+    const direct =
+      (root && typeof root === 'object')
+        ? (root.pow_difficulty ?? root.powDifficulty ?? root.difficulty)
+        : null;
+    const cand = normalizePowDifficulty(direct);
+    if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
+
+    return { difficulty: '', hasHint };
+  }
+
+  function getPowRiskInfo(difficulty) {
+    if (!difficulty || difficulty === 'N/A') {
+      return {
+        levelKey: 'riskUnknown',
+        levelLabel: t('riskUnknown'),
+        severity: 'na',
+        color: '#9ca3af',
+        percentage: 0
+      };
+    }
+    const clean = String(difficulty).replace(/^0x/i, '').replace(/^0+/, '');
+    const len = clean.length || 0;
+    if (len <= 2) {
+      return { levelKey: 'riskCritical', levelLabel: t('riskCritical'), severity: 'bad', color: '#ef4444', percentage: 100 };
+    }
+    if (len <= 3) {
+      return { levelKey: 'riskHard', levelLabel: t('riskHard'), severity: 'warn', color: '#f59e0b', percentage: 78 };
+    }
+    if (len <= 4) {
+      return { levelKey: 'riskMedium', levelLabel: t('riskMedium'), severity: 'warn', color: '#eab308', percentage: 58 };
+    }
+    if (len <= 5) {
+      return { levelKey: 'riskEasy', levelLabel: t('riskEasy'), severity: 'ok', color: '#22c55e', percentage: 28 };
+    }
+    return { levelKey: 'riskVeryEasy', levelLabel: t('riskVeryEasy'), severity: 'ok', color: '#10b981', percentage: 8 };
+  }
+
+  function setPowDifficulty(difficulty) {
+    const normalized = (difficulty === 'N/A') ? 'N/A' : normalizePowDifficulty(difficulty);
+    if (!normalized) return false;
+    if (normalized !== 'N/A' && !isPowDifficultyLike(normalized)) return false;
+    const next = normalized;
+    const info = getPowRiskInfo(next);
+    degradedState.pow.difficulty = next;
+    degradedState.pow.levelLabel = info.levelLabel;
+    degradedState.pow.levelKey = info.levelKey;
+    degradedState.pow.color = info.color;
+    degradedState.pow.percentage = info.percentage;
+    degradedState.pow.updatedAt = Date.now();
+    return true;
+  }
+
+  function applyPowDifficulty(difficulty, source) {
+    const applied = setPowDifficulty(difficulty);
+    if (!applied) return false;
+    if (degradedState.ip.full) {
+      const logs = addIPLog(degradedState.ip.full, degradedState.ip.qualityScore, degradedState.pow.difficulty);
+      if (logs.length) updateIpHistoryTooltip();
+    }
+    saveDegradedCache();
+    logEvent('debug', 'degraded.pow', {
+      difficulty: degradedState.pow.difficulty,
+      source: source || ''
+    });
+    updateUI();
+    return true;
+  }
+
+  function handlePowFromJsonData(data, source) {
+    if (!data) return;
+    const info = findPowDataInJson(data);
+    if (info.difficulty) {
+      applyPowDifficulty(info.difficulty, source);
+      return;
+    }
+    if (info.hasHint && !degradedState.pow.updatedAt) {
+      applyPowDifficulty('N/A', source ? `${source}.hint` : 'json.hint');
+    }
+  }
+
+  function getServiceIndicatorInfo(indicator, description) {
+    const ind = String(indicator || '').toLowerCase();
+    if (ind === 'none') return { severity: 'ok', color: '#10a37f', label: description || 'All Systems Operational' };
+    if (ind === 'minor') return { severity: 'warn', color: '#f59e0b', label: description || 'Minor issues' };
+    if (ind === 'major') return { severity: 'bad', color: '#f97316', label: description || 'Major issues' };
+    if (ind === 'critical') return { severity: 'bad', color: '#ef4444', label: description || 'Critical outage' };
+    return { severity: 'na', color: '#9ca3af', label: description || t('monitorUnknown') };
+  }
+
+  function isFresh(ts, ttlMs) {
+    return !!ts && (Date.now() - ts) <= ttlMs;
+  }
+
+  function isUiOpen() {
+    const root = document.getElementById(ROOT_ID);
+    return !!(root && root.classList.contains('open'));
+  }
+
+  function shouldRefreshDegraded(force) {
+    if (force) return true;
+    if (document.hidden) return false;
+    if (isUiOpen()) return true;
+    const serviceFresh = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS);
+    const ipFresh = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS);
+    return !(serviceFresh && ipFresh);
+  }
+
+  // ========================== 服务降级监控：业务逻辑 ==========================
+  function updateIpHistoryTooltip() {
+    const logs = getIPLogs();
+    const history = formatIPLogs(logs);
+    degradedState.ip.historyTooltip = history ?
+      `${t('monitorCopyHistory')}\n${t('monitorCopyHint')}\n---\n${history}` :
+      t('monitorIpTip');
+  }
+
+  function updateUserTypeFromPersona(userType) {
+    const raw = String(userType || '').toLowerCase();
+    if (!raw) return;
+    const paid = raw.includes('paid') || raw.includes('plus') || raw.includes('pro') || raw.includes('premium');
+    degradedState.user.type = raw;
+    degradedState.user.paid = paid;
+    saveDegradedCache();
+  }
+
+  function getIpRiskInfo(score) {
+    const n = Number(score);
+    if (!Number.isFinite(n)) {
+      return { label: t('riskUnknown'), short: t('riskUnknown'), probability: '', color: '#9ca3af', severity: 'na' };
+    }
+    const labelZh = (text) => text;
+    const labelEn = (text) => text;
+    if (n <= 10) {
+      return { label: lang === 'zh' ? labelZh('极低') : labelEn('Very Low'), short: lang === 'zh' ? '极低' : 'Very Low', probability: '0%–1%', color: '#22c55e', severity: 'ok' };
+    }
+    if (n <= 20) {
+      return { label: lang === 'zh' ? labelZh('很低') : labelEn('Low'), short: lang === 'zh' ? '很低' : 'Low', probability: '1%–3%', color: '#84cc16', severity: 'ok' };
+    }
+    if (n <= 35) {
+      return { label: lang === 'zh' ? labelZh('低') : labelEn('Lower'), short: lang === 'zh' ? '低' : 'Lower', probability: '3%–8%', color: '#a3e635', severity: 'ok' };
+    }
+    if (n <= 50) {
+      return { label: lang === 'zh' ? labelZh('中') : labelEn('Medium'), short: lang === 'zh' ? '中' : 'Medium', probability: '8%–20%', color: '#f59e0b', severity: 'warn' };
+    }
+    if (n <= 65) {
+      return { label: lang === 'zh' ? labelZh('中高') : labelEn('Med-High'), short: lang === 'zh' ? '中高' : 'Med-High', probability: '20%–45%', color: '#f97316', severity: 'warn' };
+    }
+    if (n <= 80) {
+      return { label: lang === 'zh' ? labelZh('高') : labelEn('High'), short: lang === 'zh' ? '高' : 'High', probability: '45%–75%', color: '#ef4444', severity: 'bad' };
+    }
+    if (n <= 90) {
+      return { label: lang === 'zh' ? labelZh('很高') : labelEn('Very High'), short: lang === 'zh' ? '很高' : 'Very High', probability: '75%–92%', color: '#dc2626', severity: 'bad' };
+    }
+    return { label: lang === 'zh' ? labelZh('极高') : labelEn('Extreme'), short: lang === 'zh' ? '极高' : 'Extreme', probability: '92%–99%', color: '#b91c1c', severity: 'bad' };
+  }
+
+  // Compact Chinese labels for the top "traffic light" bar to avoid long English strings.
+  function compactRiskLabelByScore(score) {
+    const info = getIpRiskInfo(score);
+    return info.short || info.label || t('riskUnknown');
+  }
+
+  function compactRiskLabelByKey(levelKey) {
+    const key = String(levelKey || '');
+    if (key === 'riskVeryEasy') return '极低';
+    if (key === 'riskEasy') return '低';
+    if (key === 'riskMedium') return '中';
+    if (key === 'riskHard') return '高';
+    if (key === 'riskCritical') return '严重';
+    return t('riskUnknown');
+  }
+
+  function compactServiceLabel(indicator) {
+    const ind = String(indicator || '').toLowerCase();
+    if (ind === 'none') return '正常';
+    if (ind === 'minor') return '轻微';
+    if (ind === 'major') return '重大';
+    if (ind === 'critical') return '严重';
+    return t('monitorUnknown');
+  }
+
+  function formatMiniLabel(kind, value) {
+    const v = (value == null || value === '') ? '--' : String(value);
+    if (lang === 'zh') {
+      if (kind === 'service') return `服务·${v}`;
+      if (kind === 'ip') return `IP·${v}`;
+      if (kind === 'pow') return `PoW·${v}`;
+      if (kind === 'opt') return `优化·${v}`;
+      return v;
+    }
+    if (kind === 'service') return `Svc:${v}`;
+    if (kind === 'ip') return `IP:${v}`;
+    if (kind === 'pow') return `PoW:${v}`;
+    if (kind === 'opt') return `Opt:${v}`;
+    return v;
+  }
+
+  function getMoodLines() {
+    return lang === 'zh' ? [
+      '慢一点，也是一种前进。',
+      '把注意力放在能控制的事上。',
+      '风会停，浪也会。',
+      '给自己一个暂停键。',
+      '今天也辛苦了。',
+      '别忘了呼吸。',
+      '路远，但一直在靠近。',
+      '愿你心里有光。',
+      '先完成，再完美。',
+      '每一步都算数。'
+    ] : [
+      'Slow is still forward.',
+      'Focus on what you can control.',
+      'Waves calm down.',
+      'Give yourself a pause.',
+      'You did well today.',
+      'Remember to breathe.',
+      'Keep moving closer.',
+      'May you find your light.',
+      'Done beats perfect.',
+      'Every step counts.'
+    ];
+  }
+
+  function getDailyMoodIndex(dateKey, total) {
+    if (!dateKey || !total) return 0;
+    let hash = 0;
+    for (let i = 0; i < dateKey.length; i += 1) {
+      hash = (hash * 31 + dateKey.charCodeAt(i)) % total;
+    }
+    return hash % total;
+  }
+
+  function updateMoodUI(force) {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+    const el = root.querySelector('#' + MOOD_TEXT_ID);
+    if (!el) return;
+    const now = Date.now();
+    if (!force && moodState.nextAt && now < moodState.nextAt) return;
+    const today = getLocalDateKey(new Date());
+    const cachedText = localStorage.getItem(MOOD_CACHE_TEXT_KEY) || '';
+    const cachedDate = localStorage.getItem(MOOD_CACHE_DATE_KEY) || '';
+    if (cachedText && cachedDate === today) {
+      el.textContent = cachedText;
+      const sub = root.querySelector('#' + MOOD_SUB_ID);
+      if (sub) sub.textContent = t('moodSub');
+      moodState.nextAt = getNextLocalMidnightMs();
+      return;
+    }
+    const lines = getMoodLines();
+    if (!lines.length) return;
+    const idx = getDailyMoodIndex(today, lines.length);
+    moodState.nextAt = getNextLocalMidnightMs();
+    el.textContent = lines[idx];
+    const sub = root.querySelector('#' + MOOD_SUB_ID);
+    if (sub) sub.textContent = t('moodSub');
+  }
+
+  async function refreshMoodFromApi() {
+    if (moodState.inFlight) return false;
+    const today = getLocalDateKey(new Date());
+    const cachedDate = localStorage.getItem(MOOD_CACHE_DATE_KEY) || '';
+    if (cachedDate === today && localStorage.getItem(MOOD_CACHE_TEXT_KEY)) return false;
+    const attemptDate = localStorage.getItem(MOOD_CACHE_ATTEMPT_KEY) || '';
+    if (attemptDate === today) return false;
+    moodState.inFlight = true;
+    localStorage.setItem(MOOD_CACHE_ATTEMPT_KEY, today);
+    try {
+      const text = await gmRequestText(MOOD_API_URL, 5000);
+      const data = parseJsonTextSafe(text);
+      const quote = (data && (data.text || data.data?.text || data.data?.content)) ? String(data.text || data.data?.text || data.data?.content).trim() : '';
+      if (quote) {
+        localStorage.setItem(MOOD_CACHE_TEXT_KEY, quote);
+        localStorage.setItem(MOOD_CACHE_DATE_KEY, today);
+        localStorage.setItem(MOOD_CACHE_SOURCE_KEY, 'uapis');
+        updateMoodUI(true);
+        return true;
+      }
+    }
+    catch {}
+    finally {
+      moodState.inFlight = false;
+    }
+    return false;
+  }
+
+  function getColumnContentHeight(col, excludeEl) {
+    if (!col) return 0;
+    const children = Array.from(col.children).filter((el) => el && el.tagName === 'SECTION');
+    let total = 0;
+    let count = 0;
+    for (const el of children) {
+      if (excludeEl && el === excludeEl) continue;
+      const rect = el.getBoundingClientRect();
+      if (!rect.height) continue;
+      total += rect.height;
+      count += 1;
+    }
+    if (count > 1) {
+      const style = getComputedStyle(col);
+      const gapRaw = style.rowGap || style.gap || '0';
+      const gap = Number.parseFloat(gapRaw) || 0;
+      total += gap * (count - 1);
+    }
+    return total;
+  }
+
+  function placeMoodSection() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root || !root.classList.contains('open')) return;
+    const left = root.querySelector('.cgpt-vs-col-left');
+    const right = root.querySelector('.cgpt-vs-col-right');
+    const mood = root.querySelector('#' + MOOD_SECTION_ID);
+    if (!left || !right || !mood) return;
+
+    if (window.matchMedia && window.matchMedia('(max-width: 720px)').matches) {
+      if (mood.parentElement !== left) left.appendChild(mood);
+      return;
+    }
+
+    const inLeft = left.contains(mood);
+    const inRight = right.contains(mood);
+    const leftH = getColumnContentHeight(left, inLeft ? mood : null);
+    const rightH = getColumnContentHeight(right, inRight ? mood : null);
+    const diff = leftH - rightH;
+    if (Math.abs(diff) < MOOD_BALANCE_THRESHOLD_PX) return;
+
+    if (diff > 0 && !inRight) right.appendChild(mood);
+    else if (diff < 0 && !inLeft) left.appendChild(mood);
+  }
+
+  function parseScamalytics(html, ip) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(String(html || ''), 'text/html');
+    const scoreElement = doc.querySelector('.score_bar .score');
+    const scoreMatch = scoreElement?.textContent?.match(/Fraud Score:\s*(\d+)/i);
+    const score = scoreMatch ? Number(scoreMatch[1]) : null;
+    const riskInfo = getIpRiskInfo(score);
+
+    const riskElement = doc.querySelector('.panel_title');
+    const panelColor = riskElement?.style?.backgroundColor || '';
+    const descriptionElement = doc.querySelector('.panel_body');
+    const description = (descriptionElement?.textContent || '').trim();
+    const trimmedDescription = description.length > 180 ? `${description.slice(0, 177)}...` : description;
+
+    const extractTableValue = (header) => {
+      const row = Array.from(doc.querySelectorAll('th')).find((th) => th.textContent.trim() === header)?.parentElement;
+      return row?.querySelector('td')?.textContent.trim() || '';
+    };
+    const isRiskYes = (header) => {
+      const row = Array.from(doc.querySelectorAll('th')).find((th) => th.textContent.trim() === header)?.parentElement;
+      return !!row?.querySelector('.risk.yes');
+    };
+
+    const city = extractTableValue('City');
+    const state = extractTableValue('State / Province');
+    const country = extractTableValue('Country Name');
+    const isp = extractTableValue('ISP Name');
+    const org = extractTableValue('Organization Name');
+    const warnings = [];
+    if (isRiskYes('Anonymizing VPN')) warnings.push('VPN');
+    if (isRiskYes('Tor Exit Node')) warnings.push('Tor');
+    if (isRiskYes('Server')) warnings.push('Server');
+    if (isRiskYes('Public Proxy') || isRiskYes('Web Proxy') || isRiskYes('Proxy')) warnings.push('Proxy');
+
+    const location = [city, state, country].filter(Boolean).join(', ');
+    const label = riskInfo.label || t('riskUnknown');
+    const probability = riskInfo.probability || '';
+    const color = panelColor || riskInfo.color;
+    const tooltipLines = [
+      `IP: ${ip}`,
+      score == null ? `Risk: ${label}` : `Risk: ${label} (${score}/100)`,
+      probability ? (lang === 'zh' ? `风控概率: ${probability}` : `Risk trigger: ${probability}`) : '',
+      location ? `Location: ${location}` : '',
+      isp ? `ISP: ${isp}${org ? ` (${org})` : ''}` : '',
+      warnings.length ? `Warnings: ${warnings.join(', ')}` : '',
+      trimmedDescription ? `\n${trimmedDescription}` : '',
+      '\nscamalytics.com'
+    ].filter(Boolean);
+
+    return {
+      score,
+      label,
+      short: riskInfo.short || label,
+      probability,
+      color,
+      severity: riskInfo.severity,
+      tooltip: tooltipLines.join('\n')
+    };
+  }
+
+  async function refreshServiceStatus(force = false) {
+    try {
+      if (!shouldRefreshDegraded(force)) return;
+      if (!force && isFresh(degradedState.service.updatedAt, DEG_STATUS_REFRESH_MS)) return;
+      const text = await gmRequestText('https://status.openai.com/api/v2/status.json', 4000);
+      const data = JSON.parse(text);
+      const status = data?.status || {};
+      const info = getServiceIndicatorInfo(status.indicator, status.description);
+      degradedState.service.indicator = String(status.indicator || 'none').toLowerCase();
+      degradedState.service.description = info.label;
+      degradedState.service.color = info.color;
+      degradedState.service.updatedAt = Date.now();
+      saveDegradedCache();
+      logEvent('debug', 'degraded.status', {
+        indicator: degradedState.service.indicator,
+        description: degradedState.service.description
+      });
+      updateUI();
+    }
+    catch (err) {
+      logEvent('warn', 'degraded.status.fail', { message: err?.message || String(err) });
+    }
+  }
+
+  async function refreshIPQuality(ip, force = false) {
+    if (!ip) return;
+    const now = Date.now();
+    if (!force && degradedState.ip.qualityIp === ip && (now - degradedState.ip.qualityAt) < (DEG_IP_REFRESH_MS / 2)) return;
+    try {
+      const html = await gmRequestText(`https://scamalytics.com/ip/${ip}`, 4500);
+      const info = parseScamalytics(html, ip);
+      degradedState.ip.qualityIp = ip;
+      degradedState.ip.qualityAt = now;
+      degradedState.ip.qualityScore = info.score;
+      degradedState.ip.qualityShort = info.short || info.label;
+      degradedState.ip.qualityProbability = info.probability || '';
+      const scoreText = info.score == null ? '' : ` (${info.score})`;
+      degradedState.ip.qualityLabel = `${info.label}${scoreText}`.trim();
+      degradedState.ip.qualityColor = info.color;
+      degradedState.ip.qualityTooltip = info.tooltip;
+      saveDegradedCache();
+
+      const logs = addIPLog(ip, info.score, degradedState.pow.difficulty || 'N/A');
+      if (logs.length) updateIpHistoryTooltip();
+      logEvent('debug', 'degraded.ip.quality', {
+        ip,
+        score: info.score,
+        label: info.label
+      });
+      updateUI();
+    }
+    catch (err) {
+      degradedState.ip.qualityScore = null;
+      degradedState.ip.qualityLabel = t('monitorUnknown');
+      degradedState.ip.qualityShort = '';
+      degradedState.ip.qualityProbability = '';
+      degradedState.ip.qualityColor = '#9ca3af';
+      degradedState.ip.qualityTooltip = `Scamalytics error: ${err?.message || err}`;
+      logEvent('warn', 'degraded.ip.quality.fail', { message: err?.message || String(err) });
+      updateUI();
+    }
+  }
+
+  async function handleIPFetchFailure(error) {
+    degradedState.ip.error = error?.message || String(error || '');
+    degradedState.ip.masked = 'Failed';
+    degradedState.ip.full = '';
+    degradedState.ip.warp = 'off';
+    degradedState.ip.updatedAt = Date.now();
+    degradedState.ip.qualityLabel = 'Error';
+    degradedState.ip.qualityShort = '';
+    degradedState.ip.qualityProbability = '';
+    degradedState.ip.qualityColor = '#ef4444';
+    degradedState.ip.qualityTooltip = `${t('monitorIpTip')}\n${degradedState.ip.error}`;
+    logEvent('warn', 'degraded.ip.fail', { message: degradedState.ip.error });
+    updateUI();
+  }
+
+  async function refreshIPInfo(force = false) {
+    const now = Date.now();
+    if (!shouldRefreshDegraded(force)) return;
+    if (degradedState.ip.inFlight) return;
+    if (!force && (now - degradedState.ip.lastFetchAt) < DEG_IP_COOLDOWN_MS) return;
+
+    degradedState.ip.inFlight = true;
+    degradedState.ip.lastFetchAt = now;
+
+    const services = [
+      {
+        url: 'https://chatgpt.com/cdn-cgi/trace',
+        parse: (text) => parseTrace(text)
+      },
+      {
+        url: 'https://chat.openai.com/cdn-cgi/trace',
+        parse: (text) => parseTrace(text)
+      },
+      {
+        url: 'https://www.cloudflare.com/cdn-cgi/trace',
+        parse: (text) => parseTrace(text)
+      },
+      {
+        url: 'https://ipinfo.io/json',
+        parse: (text) => {
+          const data = JSON.parse(text);
+          return {
+            ip: data.ip || '',
+            warp: 'off',
+            loc: data.loc || '',
+            colo: ''
+          };
+        }
+      }
+    ];
+
+    let lastErr = null;
+    try {
+      for (let i = 0; i < services.length; i += 1) {
+        const svc = services[i];
+        try {
+          const text = await gmRequestText(svc.url, DEG_REQ_TIMEOUT_MS);
+          const parsed = svc.parse(text);
+          if (!parsed.ip) throw new Error('No IP in response');
+
+          degradedState.ip.full = parsed.ip;
+          degradedState.ip.masked = maskIP(parsed.ip);
+          degradedState.ip.warp = parsed.warp || 'off';
+          degradedState.ip.updatedAt = Date.now();
+          degradedState.ip.error = '';
+          saveDegradedCache();
+          updateIpHistoryTooltip();
+          logEvent('debug', 'degraded.ip', { ip: degradedState.ip.masked, warp: degradedState.ip.warp, svc: svc.url });
+          updateUI();
+          refreshIPQuality(parsed.ip, force);
+          return;
+        }
+        catch (err) {
+          lastErr = err;
+        }
+      }
+      handleIPFetchFailure(lastErr || new Error('All IP services failed'));
+    }
+    finally {
+      degradedState.ip.inFlight = false;
+    }
+  }
+
+  async function refreshPowViaRequirements(force = false) {
+    const now = Date.now();
+    if (!force && isFresh(degradedState.pow.updatedAt, DEG_POW_TTL_MS)) return false;
+    if (!force && (now - degradedState.pow.lastProbeAt) < DEG_POW_PROBE_COOLDOWN_MS) return false;
+    degradedState.pow.lastProbeAt = now;
+
+    const urls = [
+      '/backend-api/sentinel/chat-requirements',
+      '/backend-api/sentinel/requirements',
+      '/api/sentinel/chat-requirements',
+      '/api/sentinel/requirements'
+    ];
+    let lastErr = null;
+
+    for (const url of urls) {
+      const methods = ['GET', 'POST'];
+      for (const method of methods) {
+        try {
+          const opts = {
+            method,
+            credentials: 'include',
+            headers: {
+              'accept': 'application/json'
+            }
+          };
+          if (method === 'POST') {
+            opts.headers['content-type'] = 'application/json';
+            opts.body = '{}';
+          }
+          const res = await fetch(url, opts);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await readJsonSafe(res);
+          if (!data) throw new Error('Empty JSON');
+          const info = findPowDataInJson(data);
+          if (info.difficulty) {
+            applyPowDifficulty(info.difficulty, 'probe');
+            return true;
+          }
+          if (info.hasHint) {
+            applyPowDifficulty('N/A', 'probe.hint');
+            return true;
+          }
+        }
+        catch (err) {
+          lastErr = err;
+        }
+      }
+    }
+
+    if (force && lastErr) {
+      logEvent('debug', 'degraded.pow.probe.fail', { message: lastErr?.message || String(lastErr) });
+    }
+    return false;
+  }
+
+  function isChatRequirementsUrl(url) {
+    const u = String(url || '');
+    return u.includes('/backend-api/sentinel/chat-requirements') ||
+      u.includes('/backend-api/sentinel/requirements') ||
+      u.includes('/backend-anon/sentinel/chat-requirements') ||
+      u.includes('/backend-anon/sentinel/requirements') ||
+      u.includes('/api/sentinel/chat-requirements') ||
+      u.includes('/api/sentinel/requirements');
+  }
+
+  function handleChatRequirementsResponse(response, resource) {
+    const url = getResourceUrl(resource, response);
+    if (!isChatRequirementsUrl(url)) return;
+
+    (async () => {
+      try {
+        if (!response || typeof response.clone !== 'function') return;
+        let cloned;
+        try {
+          cloned = response.clone();
+        }
+        catch (err) {
+          logEvent('debug', 'degraded.chatReq.cloneFail', { message: err?.message || String(err) });
+          return;
+        }
+        const contentType = cloned.headers?.get?.('content-type') || '';
+        if (!isJsonContentType(contentType)) return;
+        const data = await readJsonSafe(cloned);
+        if (!data) return;
+
+        const persona = data?.persona || data?.user_type || data?.account_type;
+        if (persona) updateUserTypeFromPersona(persona);
+
+        const powInfo = findPowDataInJson(data);
+        if (powInfo.difficulty) {
+          applyPowDifficulty(powInfo.difficulty, 'chatReq');
+        }
+        else if (powInfo.hasHint && !degradedState.pow.updatedAt) {
+          applyPowDifficulty('N/A', 'chatReq.hint');
+        }
+        logEvent('debug', 'degraded.chatReq', {
+          difficulty: powInfo.difficulty || (powInfo.hasHint ? 'N/A' : ''),
+          persona: persona || ''
+        });
+      }
+      catch (err) {
+        logEvent('debug', 'degraded.chatReq.fail', { message: err?.message || String(err) });
+      }
+    })();
+  }
+
+  function findPowDifficultyFromHeaders(headers) {
+    if (!headers || typeof headers.get !== 'function') return '';
+    const candidates = [
+      'x-openai-pow-difficulty',
+      'x-openai-proofofwork-difficulty',
+      'x-openai-proof-of-work-difficulty',
+      'x-openai-proof-of-work',
+      'x-openai-pow'
+    ];
+    for (const key of candidates) {
+      const val = normalizePowDifficulty(headers.get(key));
+      if (val && isPowDifficultyLike(val)) return val;
+    }
+    let found = '';
+    if (typeof headers.forEach === 'function') {
+      headers.forEach((value, key) => {
+        if (found) return;
+        const k = String(key || '').toLowerCase();
+        if (k.includes('pow') || k.includes('proof-of-work') || k.includes('proofofwork')) {
+          const val = normalizePowDifficulty(value);
+          if (val && isPowDifficultyLike(val)) found = val;
+        }
+      });
+    }
+    return found;
+  }
+
+  function findPowDifficultyFromHeadersLike(headers) {
+    if (!headers) return '';
+    if (typeof headers.get === 'function') return findPowDifficultyFromHeaders(headers);
+    if (Array.isArray(headers)) {
+      for (const entry of headers) {
+        if (!entry || entry.length < 2) continue;
+        const key = String(entry[0] || '').toLowerCase();
+        if (!key.includes('pow') && !key.includes('proof-of-work') && !key.includes('proofofwork')) continue;
+        const val = normalizePowDifficulty(entry[1]);
+        if (val && isPowDifficultyLike(val)) return val;
+      }
+      return '';
+    }
+    if (typeof headers === 'object') {
+      for (const [keyRaw, valRaw] of Object.entries(headers)) {
+        const key = String(keyRaw || '').toLowerCase();
+        if (!key.includes('pow') && !key.includes('proof-of-work') && !key.includes('proofofwork')) continue;
+        const val = normalizePowDifficulty(valRaw);
+        if (val && isPowDifficultyLike(val)) return val;
+      }
+    }
+    return '';
+  }
+
+  function handlePowFromHeaders(response) {
+    if (!response || !response.headers) return;
+    const diff = findPowDifficultyFromHeaders(response.headers);
+    if (!diff) return;
+    applyPowDifficulty(diff, 'header');
+  }
+
+  function handlePowFromXhr(xhr) {
+    if (!xhr || typeof xhr.getResponseHeader !== 'function') return;
+    const headersShim = {
+      get: (key) => xhr.getResponseHeader(key),
+      forEach: (cb) => {
+        const raw = (typeof xhr.getAllResponseHeaders === 'function') ? xhr.getAllResponseHeaders() : '';
+        raw.split(/\r?\n/).forEach((line) => {
+          if (!line) return;
+          const idx = line.indexOf(':');
+          if (idx <= 0) return;
+          const k = line.slice(0, idx).trim();
+          const v = line.slice(idx + 1).trim();
+          cb(v, k);
+        });
+      }
+    };
+    const diff = findPowDifficultyFromHeaders(headersShim);
+    if (diff) applyPowDifficulty(diff, 'xhr.header');
+
+    try {
+      const url = xhr.__cgpt_xhr_url || '';
+      const contentType = xhr.getResponseHeader('content-type') || '';
+      if (!isChatRequirementsUrl(url) && !isJsonContentType(contentType)) return;
+      const text = xhr.responseText || '';
+      if (!text) return;
+      const data = parseJsonTextSafe(text);
+      if (!data) return;
+      const persona = data?.persona || data?.user_type || data?.account_type;
+      if (persona) updateUserTypeFromPersona(persona);
+      handlePowFromJsonData(data, 'xhr.json');
+    }
+    catch {}
+  }
+
+  async function handlePowFromJsonResponse(response, resource) {
+    if (!response || typeof response.clone !== 'function') return;
+    const url = getResourceUrl(resource, response);
+    const sameOrigin = !url || url.startsWith('/') || url.startsWith(location.origin);
+    if (!sameOrigin) return;
+    if (isChatRequirementsUrl(url)) return;
+    const path = url && url.startsWith(location.origin) ? url.slice(location.origin.length) : url;
+    if (path && !/\/backend-|\/api\//i.test(path)) return;
+    const contentType = response.headers?.get?.('content-type') || '';
+    if (!isJsonContentType(contentType)) return;
+    let cloned;
+    try {
+      cloned = response.clone();
+    }
+    catch {
+      return;
+    }
+    const data = await readJsonSafe(cloned);
+    if (!data) return;
+    const persona = data?.persona || data?.user_type || data?.account_type;
+    if (persona) updateUserTypeFromPersona(persona);
+    handlePowFromJsonData(data, 'fetch.json');
+  }
+
+  function handlePowFromFetchRequest(resource, init) {
+    const headers =
+      (init && init.headers) ||
+      ((resource && typeof resource === 'object') ? resource.headers : null);
+    const diff = findPowDifficultyFromHeadersLike(headers);
+    if (diff) applyPowDifficulty(diff, 'fetch.reqHeader');
+  }
+
+  function wrapFetch(currentFetch) {
+    if (typeof currentFetch !== 'function') return currentFetch;
+    if (currentFetch[FETCH_WRAP_KEY]) return currentFetch;
+
+    const wrappedFetch = function () {
+      try {
+        handlePowFromFetchRequest(arguments[0], arguments[1]);
+      }
+      catch {}
+      const resPromise = currentFetch.apply(this, arguments);
+      return resPromise.then((response) => {
+        try {
+          handleChatRequirementsResponse(response, arguments[0]);
+          handlePowFromHeaders(response);
+          handlePowFromJsonResponse(response, arguments[0]);
+        }
+        catch {}
+        return response;
+      });
+    };
+
+    try {
+      Object.defineProperty(wrappedFetch, FETCH_WRAP_KEY, {
+        value: true,
+        configurable: true
+      });
+    }
+    catch {
+      wrappedFetch[FETCH_WRAP_KEY] = true;
+    }
+
+    return wrappedFetch;
+  }
+
+  function ensureFetchHook() {
+    const currentFetch = PAGE_WIN.fetch || window.fetch;
+    if (typeof currentFetch !== 'function') return false;
+    const wrapped = currentFetch[FETCH_WRAP_KEY] ? currentFetch : wrapFetch(currentFetch);
+    try {
+      PAGE_WIN.fetch = wrapped;
+    }
+    catch (err) {
+      logEvent('debug', 'degraded.fetch.hookFail', { message: err?.message || String(err) });
+    }
+    try {
+      window.fetch = wrapped;
+    }
+    catch {}
+    return !!wrapped;
+  }
+
+  function ensureXhrHook() {
+    const xhrCtor = PAGE_WIN.XMLHttpRequest || window.XMLHttpRequest;
+    const proto = xhrCtor && xhrCtor.prototype;
+    if (!proto) return false;
+    if (proto[XHR_WRAP_KEY]) return true;
+
+    const originalOpen = proto.open;
+    const originalSend = proto.send;
+
+    proto.open = function () {
+      try {
+        this.__cgpt_xhr_url = arguments[1];
+      }
+      catch {}
+      return originalOpen.apply(this, arguments);
+    };
+
+    proto.send = function () {
+      try {
+        this.addEventListener('load', () => handlePowFromXhr(this));
+      }
+      catch {}
+      return originalSend.apply(this, arguments);
+    };
+
+    try {
+      Object.defineProperty(proto, XHR_WRAP_KEY, {
+        value: true,
+        configurable: true
+      });
+    }
+    catch {
+      proto[XHR_WRAP_KEY] = true;
+    }
+    return true;
+  }
+
+  function startFetchMonitor() {
+    if (degradedTimers.fetchMonitor) return;
+    const startAt = Date.now();
+    const tick = () => {
+      ensureFetchHook();
+      ensureXhrHook();
+      const elapsed = Date.now() - startAt;
+      const delay = elapsed < 60000 ? DEG_FETCH_MONITOR_FAST_MS : DEG_FETCH_MONITOR_SLOW_MS;
+      degradedTimers.fetchMonitor = setTimeout(tick, delay);
+    };
+    tick();
+  }
+
+  function startDegradedMonitors() {
+    if (degradedStarted) return;
+    degradedStarted = true;
+    ensureFetchHook();
+    ensureXhrHook();
+    startFetchMonitor();
+    refreshServiceStatus(true);
+    refreshIPInfo(true);
+    refreshPowViaRequirements(false);
+    degradedTimers.status = setInterval(() => refreshServiceStatus(false), DEG_STATUS_REFRESH_MS);
+    degradedTimers.ip = setInterval(() => refreshIPInfo(false), DEG_IP_REFRESH_MS);
+  }
+  // endregion: Degradation Monitor (network + parsing)
+
+  // region: Health Scoring & Telemetry
+  function severityRank(level) {
+    if (level === 'bad') return 2;
+    if (level === 'warn') return 1;
+    if (level === 'ok') return 0;
+    return -1;
+  }
+
+  function maxSeverity(levels) {
+    let best = 'na';
+    let bestRank = -1;
+    levels.forEach((lv) => {
+      const r = severityRank(lv);
+      if (r > bestRank) {
+        bestRank = r;
+        best = lv;
+      }
+    });
+    return best;
+  }
+
+  function getDegradedHealth() {
+    const serviceSev = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS) ?
+      getServiceIndicatorInfo(degradedState.service.indicator, degradedState.service.description).severity :
+      'na';
+    const ipSev = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS) ?
+      getIpRiskInfo(degradedState.ip.qualityScore).severity :
+      'na';
+    const powSev = isFresh(degradedState.pow.updatedAt, DEG_POW_TTL_MS) ?
+      getPowRiskInfo(degradedState.pow.difficulty).severity :
+      'na';
+    return {
+      severity: maxSeverity([serviceSev, ipSev, powSev]),
+      serviceSev,
+      ipSev,
+      powSev
+    };
+  }
+
+  function logVirtualizeStats(meta) {
+    const now = Date.now();
+    const costHot = meta.costMs >= 24;
+    const sig = `${meta.turns}|${meta.slimmed}|${meta.marginScreens}|${Math.round(meta.viewportY / 200)}`;
+    if (!costHot && sig === lastVirtSig && (now - lastVirtLogAt) < LOG_VIRT_THROTTLE_MS) return;
+    lastVirtSig = sig;
+    lastVirtLogAt = now;
+    logEvent(costHot ? 'warn' : 'debug', 'virtualize', meta);
+  }
+
+  function logHealthIfNeeded(info) {
+    const now = Date.now();
+    const sig = `${info.worst}|${info.memLevel}|${info.domLevel}|${info.turns}|${info.virt}|${info.enabled}|${info.ctrlF}|${info.chatBusy}|${info.autoPause}|${info.degradedSeverity}|${info.serviceSev}|${info.ipSev}|${info.powSev}`;
+    const degradedWarnish = (info.degradedSeverity === 'warn' || info.degradedSeverity === 'bad');
+    const warnish = (degradedWarnish || info.worst === 'warn' || info.worst === 'bad' || !info.enabled);
+    if (sig === lastHealthSig && (!warnish || (now - lastHealthLogAt) < LOG_HEALTH_THROTTLE_MS)) return;
+    lastHealthSig = sig;
+    lastHealthLogAt = now;
+    let level = (info.worst === 'bad') ? 'warn' : (info.worst === 'warn' ? 'info' : 'debug');
+    if (info.degradedSeverity === 'bad' && level !== 'warn') level = 'warn';
+    else if (info.degradedSeverity === 'warn' && level === 'debug') level = 'info';
+    logEvent(level, 'health', info);
+  }
+  // endregion: Health Scoring & Telemetry
+
+  function setIntrinsicSize(el, height) {
+    const h = Math.max(24, Math.round(Number(height) || 0));
+    if (!h || !isFinite(h)) return;
+    el.style.setProperty('--cgpt-vs-h', `${h}px`);
+  }
+
+  function setSlimClass(el, shouldSlim) {
+    const has = el.classList.contains(VS_SLIM_CLASS);
+    const before = softSlimCount;
+    if (shouldSlim && !has) {
+      el.classList.add(VS_SLIM_CLASS);
+      softSlimCount += 1;
+    }
+    else if (!shouldSlim && has) {
+      el.classList.remove(VS_SLIM_CLASS);
+      softSlimCount = Math.max(0, softSlimCount - 1);
+    }
+    if (softSlimCount !== before) lastVirtualizedCount = softSlimCount;
+  }
+
+  function clearSoftSlim() {
+    for (const el of softObserved) {
+      setSlimClass(el, false);
+    }
+    softSlimCount = 0;
+    lastVirtualizedCount = 0;
+  }
+
+  function ensureSoftObserver(marginScreens) {
+    if (!useSoftVirtualization) return;
+    const scrollInfo = getScrollMetrics();
+    const rootEl = scrollInfo.isWindow ? null : scrollInfo.root;
+    const baseH = scrollInfo.height || window.innerHeight || 0;
+    const marginPx = Math.max(0, Math.round(baseH * marginScreens));
+    const margin = `${marginPx}px 0px ${marginPx}px 0px`;
+    if (softObserver && softObserverMargin === margin && softObserverRoot === rootEl) return;
+
+    if (softObserver) softObserver.disconnect();
+    softObserverMargin = margin;
+    softObserverRoot = rootEl;
+    softObserver = new IntersectionObserver((entries) => {
+    const pausedByChat = autoPauseOnChat && chatBusy;
+    const active = virtualizationEnabled && !ctrlFFreeze && !pausedByChat;
+      for (const entry of entries) {
+        const el = entry.target;
+        if (entry.isIntersecting) {
+          setIntrinsicSize(el, entry.boundingClientRect.height);
+          if (el && el.dataset && el.dataset.vsSlimmed) {
+            restoreHardSlim(el);
+          }
+        }
+        if (!virtualizationEnabled || ctrlFFreeze) {
+          setSlimClass(el, false);
+          continue;
+        }
+        if (!active) continue;
+        setSlimClass(el, !entry.isIntersecting);
+      }
+      lastVirtualizedCount = softSlimCount;
+    }, {
+      root: rootEl,
+      rootMargin: margin
+    });
+
+    for (const el of softObserved) {
+      softObserver.observe(el);
+    }
+  }
+
+  function syncSoftNodes(reason) {
+    if (!useSoftVirtualization) return;
+
+    const busy = autoPauseOnChat && updateChatBusy(false);
+    if (busy) {
+      softSyncDeferred = true;
+      setOptimizeActive(false);
+      return;
+    }
+
+    setOptimizeActive(true);
+    const nodes = getMessageNodes();
+    lastTurnsCount = nodes.length;
+
+    const next = new Set(nodes);
+    const toRemove = [];
+    for (const el of softObserved) {
+      if (!next.has(el)) toRemove.push(el);
+    }
+    if (toRemove.length) {
+      for (const el of toRemove) {
+        if (softObserver) softObserver.unobserve(el);
+        if (el.classList.contains(VS_SLIM_CLASS)) softSlimCount = Math.max(0, softSlimCount - 1);
+        softObserved.delete(el);
+      }
+    }
+
+    for (const el of nodes) {
+      if (!softObserved.has(el)) {
+        softObserved.add(el);
+        if (softObserver) softObserver.observe(el);
+      }
+    }
+
+    if (!virtualizationEnabled || ctrlFFreeze) {
+      clearSoftSlim();
+    }
+    lastVirtualizedCount = softSlimCount;
+
+    if (reason) {
+      logEvent('debug', 'soft.sync', {
+        reason,
+        nodes: nodes.length,
+        slim: softSlimCount
+      });
+    }
+    setOptimizeActive(false);
+  }
+
+  function scheduleSoftSync(reason) {
+    if (!useSoftVirtualization) return;
+    const pausedByChat = autoPauseOnChat && chatBusy;
+    if (pausedByChat) softSyncDeferred = true;
+    if (softSyncPending) return;
+    softSyncPending = true;
+    if (softSyncTimer) clearTimeout(softSyncTimer);
+    const delay = pausedByChat ? SOFT_SYNC_CHAT_DEBOUNCE_MS : SOFT_SYNC_DEBOUNCE_MS;
+    softSyncTimer = setTimeout(() => {
+      softSyncPending = false;
+      if (autoPauseOnChat && chatBusy) {
+        softSyncDeferred = true;
+        return;
+      }
+      softSyncDeferred = false;
+      syncSoftNodes(reason || (pausedByChat ? 'deferred' : 'debounced'));
+    }, delay);
+  }
+
+  function findMessageContainer() {
+    const first = document.querySelector('div[data-message-id], [data-testid="conversation-turn"]');
+    if (first) return first.closest('main') || first.parentElement;
+    return document.querySelector('main') || document.body;
+  }
+
+  function ensureMessageObserver() {
+    if (!useSoftVirtualization) return;
+    const container = findMessageContainer();
+    if (!container) return;
+    if (msgObserver && msgContainer === container) return;
+
+    if (msgObserver) msgObserver.disconnect();
+    msgContainer = container;
+    scrollRootAt = 0;
+    installScrollHook();
+    msgObserver = new MutationObserver((mutations) => {
+      let hit = false;
+      for (const m of mutations) {
+        if (m.addedNodes && m.addedNodes.length) {
+          hit = true;
+          break;
+        }
+        if (m.removedNodes && m.removedNodes.length) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        markMsgCacheDirty();
+        scheduleSoftSync('mutation');
+      }
+    });
+    msgObserver.observe(container, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // ========================== 工具函数 ==========================
+  function loadBool(key, def) {
+    const v = localStorage.getItem(key);
+    if (v === null || v === undefined) return def;
+    return v === '1';
+  }
+
+  function saveBool(key, val) {
+    localStorage.setItem(key, val ? '1' : '0');
+  }
+
+  function loadMode() {
+    const v = localStorage.getItem(KEY_MODE);
+    return (v === 'performance' || v === 'balanced' || v === 'conservative') ? v : 'balanced';
+  }
+
+  function saveMode(mode) {
+    currentMode = mode;
+    localStorage.setItem(KEY_MODE, mode);
+    markMarginCacheDirty();
+  }
+
+  function loadPos() {
+    try {
+      const raw = localStorage.getItem(KEY_POS);
+      if (!raw) return {
+        x: 18,
+        y: 64
+      };
+      const p = JSON.parse(raw);
+      if (typeof p.x === 'number' && typeof p.y === 'number') {
+        return {
+          x: clamp(p.x, 0, window.innerWidth - 40),
+          y: clamp(p.y, 0, window.innerHeight - 40)
+        };
+      }
+    }
+    catch {}
+    return {
+      x: 18,
+      y: 64
+    };
+  }
+
+  function savePos() {
+    localStorage.setItem(KEY_POS, JSON.stringify(pinnedPos));
+  }
+
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function getTurnCountForMargins() {
+    if (!msgCacheDirty && lastTurnsCount) return lastTurnsCount;
+    const nodes = getMessageNodes();
+    if (nodes && nodes.length) return nodes.length;
+    return lastTurnsCount || 0;
+  }
+
+  function getMarginShiftByTurns(turns) {
+    if (turns < MARGIN_TURN_STEPS[0]) return 1;
+    if (turns < MARGIN_TURN_STEPS[1]) return 0;
+    if (turns < MARGIN_TURN_STEPS[2]) return -1;
+    if (turns < MARGIN_TURN_STEPS[3]) return -2;
+    return -3;
+  }
+
+  function getAutoHardTurnFactor(turns) {
+    const t = Math.max(0, Number(turns) || 0);
+    for (let i = 0; i < AUTO_HARD_TURN_STEPS.length; i += 1) {
+      if (t < AUTO_HARD_TURN_STEPS[i]) return AUTO_HARD_TURN_FACTORS[i];
+    }
+    return AUTO_HARD_TURN_FACTORS[AUTO_HARD_TURN_FACTORS.length - 1];
+  }
+
+  function computeAutoHardThreshold(turns, mode) {
+    const base = AUTO_HARD_DOM_THRESHOLD;
+    const modeFactor =
+      (mode === 'performance') ? 0.88 :
+      (mode === 'conservative') ? 1.12 :
+      1.0;
+    const turnFactor = getAutoHardTurnFactor(turns);
+    const raw = Math.round(base * modeFactor * turnFactor);
+    const min = Math.max(3500, Math.round(DOM_OK * 0.7));
+    const max = Math.round(DOM_WARN * 1.4);
+    return clamp(raw, min, max);
+  }
+
+  function computeAutoHardExit(threshold) {
+    const raw = Math.round(Number(threshold || AUTO_HARD_EXIT_DOM) * 0.6);
+    const max = Math.min(AUTO_HARD_EXIT_DOM, Math.max(2600, (threshold - 400)));
+    return clamp(raw, 2400, max);
+  }
+
+  // DP-based planner: choose soft/hard margins that balance target, stability, and overscan.
+  function planMarginsDP(turns, mode, prev) {
+    const limits = MODE_MARGIN_LIMITS[mode] || MODE_MARGIN_LIMITS.balanced;
+    const baseSoft = MODE_TO_SOFT_MARGIN_SCREENS[mode] ?? MODE_TO_SOFT_MARGIN_SCREENS.balanced;
+    const baseHard = MODE_TO_HARD_MARGIN_SCREENS[mode] ?? Math.max(2, baseSoft * 2);
+    const shift = getMarginShiftByTurns(turns);
+    const desiredSoft = clamp(baseSoft + shift, limits.minSoft, limits.maxSoft);
+    const desiredHard = clamp(baseHard + (shift * 2), limits.minHard, limits.maxHard);
+    const weights = MODE_PLAN_WEIGHTS[mode] || MODE_PLAN_WEIGHTS.balanced;
+
+    const softCandidates = [];
+    for (let s = limits.minSoft; s <= limits.maxSoft; s += 1) softCandidates.push(s);
+    const hardCandidates = [];
+    for (let h = limits.minHard; h <= limits.maxHard; h += 1) hardCandidates.push(h);
+
+    const prevSoft = prev && typeof prev.soft === 'number' ? prev.soft : desiredSoft;
+    const prevHard = prev && typeof prev.hard === 'number' ? prev.hard : desiredHard;
+
+    let best = { soft: desiredSoft, hard: Math.max(desiredHard, desiredSoft + 1) };
+    let bestCost = Infinity;
+    const turnPenalty = Math.min(1.2, Math.max(0.2, (turns || 0) / 220));
+
+    const dp = [];
+    for (const s of softCandidates) {
+      let bestHard = null;
+      let bestHardCost = Infinity;
+      for (const h of hardCandidates) {
+        if (h < s + 1) continue;
+        const targetCost =
+          Math.abs(s - desiredSoft) * weights.soft +
+          Math.abs(h - desiredHard) * weights.hard;
+        const changeCost =
+          (Math.abs(s - prevSoft) + Math.abs(h - prevHard)) * weights.change;
+        const overscanCost = (s + h) * weights.overscan * (1 + turnPenalty);
+        const cost = targetCost + changeCost + overscanCost;
+        if (cost < bestHardCost) {
+          bestHardCost = cost;
+          bestHard = h;
+        }
+      }
+      dp.push({ soft: s, hard: bestHard, cost: bestHardCost });
+    }
+
+    for (const row of dp) {
+      if (row.cost < bestCost) {
+        bestCost = row.cost;
+        best = { soft: row.soft, hard: row.hard };
+      }
+    }
+
+    if (best.hard < best.soft + 1) best.hard = best.soft + 1;
+    return {
+      soft: best.soft,
+      hard: best.hard,
+      desiredSoft,
+      desiredHard
+    };
+  }
+
+  function getHardSliceBudget(remainingRatio, step) {
+    const ratio = Math.max(0, Math.min(1, remainingRatio));
+    const curve = Math.pow(ratio, 0.6);
+    const base = HARD_SLICE_BUDGET_MIN_MS +
+      (HARD_SLICE_BUDGET_MAX_MS - HARD_SLICE_BUDGET_MIN_MS) * curve;
+    const boost = step <= 2 ? 1.15 : (step <= 4 ? 1.05 : 1);
+    return clamp(base * boost, HARD_SLICE_BUDGET_MIN_MS, HARD_SLICE_BUDGET_MAX_MS);
+  }
+
+  function getDynamicMargins(force) {
+    const now = Date.now();
+    const overrideActive = marginCache.overrideUntil && now < marginCache.overrideUntil;
+    if (!force && marginCache.at && marginCache.mode === currentMode && (overrideActive || (now - marginCache.at) < MARGIN_TTL_MS)) {
+      return marginCache;
+    }
+    if (marginCache.overrideUntil && now >= marginCache.overrideUntil) {
+      marginCache.overrideUntil = 0;
+      marginCache.overrideReason = '';
+    }
+
+    const turns = getTurnCountForMargins();
+    const prev = marginCache.at ? { soft: marginCache.soft, hard: marginCache.hard } : null;
+    const planned = planMarginsDP(turns, currentMode, prev);
+    const autoHardDom = computeAutoHardThreshold(turns, currentMode);
+    const autoHardExit = computeAutoHardExit(autoHardDom);
+
+    marginCache = {
+      at: now,
+      soft: planned.soft,
+      hard: planned.hard,
+      desiredSoft: planned.desiredSoft,
+      desiredHard: planned.desiredHard,
+      autoHardDom,
+      autoHardExit,
+      turns,
+      mode: currentMode,
+      overrideUntil: 0,
+      overrideReason: ''
+    };
+    return marginCache;
+  }
+
+  function getResourcePressure(domNodes, usedMB) {
+    const domRatio = domNodes ? (domNodes / DOM_WARN) : 0;
+    const memRatio = (usedMB == null || !isFinite(usedMB)) ? 0 : (usedMB / MEM_WARNING_MB);
+    const ratio = Math.max(domRatio, memRatio);
+    let level = 'low';
+    if (ratio >= OPTIMIZE_PRESSURE_CRITICAL) level = 'critical';
+    else if (ratio >= OPTIMIZE_PRESSURE_HIGH) level = 'high';
+    else if (ratio >= OPTIMIZE_PRESSURE_MED) level = 'medium';
+    return {
+      ratio,
+      domRatio,
+      memRatio,
+      level
+    };
+  }
+
+  function planOptimizeMargins(domNodes, usedMB) {
+    const base = getDynamicMargins(true);
+    const pressure = getResourcePressure(domNodes, usedMB);
+    const limits = MODE_MARGIN_LIMITS[currentMode] || MODE_MARGIN_LIMITS.balanced;
+    let delta = 0;
+    if (pressure.level === 'critical') delta = -2;
+    else if (pressure.level === 'high') delta = -1;
+    let soft = clamp(base.soft + delta, limits.minSoft, limits.maxSoft);
+    let hard = clamp(base.hard + (delta * 2), limits.minHard, limits.maxHard);
+    if (hard < soft + 1) hard = Math.min(limits.maxHard, soft + 1);
+    return {
+      base,
+      pressure,
+      soft,
+      hard
+    };
+  }
+
+  function shouldBypassOptimizeGate(now) {
+    if (marginCache.overrideUntil && now < marginCache.overrideUntil) return true;
+    if (optimizeState.active) return true;
+    return false;
+  }
+
+  function isAutoOptimizeReady(turns) {
+    const turnReady = Number.isFinite(turns) && turns >= AUTO_OPTIMIZE_MIN_TURNS;
+    return turnReady;
+  }
+
+  function getOptimizeGateStatus(now, turns) {
+    const manualOverride = shouldBypassOptimizeGate(now);
+    const loadReady = isAutoOptimizeReady(turns);
+    return {
+      ready: manualOverride || loadReady,
+      loadReady,
+      manualOverride
+    };
+  }
+
+  function getOptimizeGateStatusByTurns(now, turns) {
+    return getOptimizeGateStatus(now, turns);
+  }
+
+  function setMarginOverridePlan(plan, reason) {
+    const now = Date.now();
+    const turns = (plan && typeof plan.turns === 'number') ? plan.turns : getTurnCountForMargins();
+    const autoHardDom = computeAutoHardThreshold(turns, currentMode);
+    const autoHardExit = computeAutoHardExit(autoHardDom);
+    marginCache = {
+      at: now,
+      soft: plan.soft,
+      hard: plan.hard,
+      desiredSoft: plan.desiredSoft ?? plan.soft,
+      desiredHard: plan.desiredHard ?? plan.hard,
+      autoHardDom,
+      autoHardExit,
+      turns,
+      mode: currentMode,
+      overrideUntil: now + OPTIMIZE_PLAN_HOLD_MS,
+      overrideReason: reason || ''
+    };
+  }
+
+  function runAutoOptimize(reason) {
+    const domNodes = getDomNodeCount();
+    const usedMB = getUsedHeapMB();
+    const planned = planOptimizeMargins(domNodes, usedMB);
+    const pressure = planned.pressure;
+    const shouldHard = !useSoftVirtualization ||
+      pressure.level === 'high' ||
+      pressure.level === 'critical';
+
+    virtualizationEnabled = true;
+    saveBool(KEY_ENABLED, true);
+
+    if (shouldHard) {
+      hardActive = true;
+      hardActiveSource = 'auto';
+      autoHardBelowAt = 0;
+      lastAutoHardAt = Date.now();
+    }
+    else {
+      hardActive = false;
+      hardActiveSource = '';
+      autoHardBelowAt = 0;
+      restoreHardSlimAll();
+    }
+
+    setMarginOverridePlan({
+      soft: planned.soft,
+      hard: planned.hard,
+      desiredSoft: planned.base.desiredSoft,
+      desiredHard: planned.base.desiredHard,
+      turns: planned.base.turns
+    }, reason || 'optimize');
+
+    scheduleVirtualize(planned.soft);
+    updateUI();
+    flashDot();
+
+    logEvent('info', 'optimize.auto', {
+      reason: reason || 'manual',
+      pressure,
+      domNodes,
+      memMB: usedMB == null ? null : Number(usedMB.toFixed(1)),
+      softScreens: planned.soft,
+      hardScreens: planned.hard,
+      hardActive: shouldHard
+    });
+  }
+
+  function getSoftMarginScreens() {
+    return getDynamicMargins().soft;
+  }
+
+  function getHardMarginScreens() {
+    return getDynamicMargins().hard;
+  }
+
+  function getUsedHeapMB() {
+    const p = window.performance;
+    if (!p || !p.memory || !p.memory.usedJSHeapSize) return null;
+    return p.memory.usedJSHeapSize / (1024 * 1024);
+  }
+
+  function memoryLevel(usedMB) {
+    if (usedMB == null) return {
+      label: lang === 'zh' ? '不可用' : 'N/A',
+      level: 'na'
+    };
+    if (usedMB < MEM_STABLE_MB) return {
+      label: `${usedMB.toFixed(0)}MB${lang === 'zh' ? '（稳定）' : ' (OK)'}`,
+      level: 'ok'
+    };
+    if (usedMB < MEM_WARNING_MB) return {
+      label: `${usedMB.toFixed(0)}MB${lang === 'zh' ? '（偏高）' : ' (High)'}`,
+      level: 'warn'
+    };
+    return {
+      label: `${usedMB.toFixed(0)}MB${lang === 'zh' ? '（警告）' : ' (Warn)'}`,
+      level: 'bad'
+    };
+  }
+
+  function domLevel(domNodes) {
+    if (!Number.isFinite(domNodes) || domNodes <= 0) {
+      return {
+        label: lang === 'zh' ? '不可用' : 'N/A',
+        level: 'na'
+      };
+    }
+    if (domNodes < DOM_OK) return {
+      label: `${domNodes}`,
+      level: 'ok'
+    };
+    if (domNodes < DOM_WARN) return {
+      label: `${domNodes}`,
+      level: 'warn'
+    };
+    return {
+      label: `${domNodes}`,
+      level: 'bad'
+    };
+  }
+
+  function estimateRemainingTurns(usedMB, turns) {
+    if (usedMB == null || !turns || turns < 12) return null;
+    const avg = usedMB / turns;
+    if (!isFinite(avg) || avg <= 0) return null;
+    const headroom = MEM_WARNING_MB - usedMB;
+    const remaining = Math.floor(headroom / avg);
+    return clamp(remaining, 0, 9999);
+  }
+
+  function modeLabel(mode) {
+    if (lang === 'en') {
+      if (mode === 'performance') return 'Performance';
+      if (mode === 'balanced') return 'Balanced';
+      if (mode === 'conservative') return 'Conservative';
+      return 'Balanced';
+    }
+    if (mode === 'performance') return '性能';
+    if (mode === 'balanced') return '平衡';
+    if (mode === 'conservative') return '保守';
+    return '平衡';
+  }
+
+  function suggestionText(domNodes, usedMB, virtCount, turns) {
+    const mem = memoryLevel(usedMB).level;
+    const dom = domLevel(domNodes).level;
+
+    if (!virtualizationEnabled) {
+      return lang === 'zh' ?
+        '建议：你已暂停虚拟化。对话会更“完整可见”，但长对话更容易卡顿。需要顺滑时点“启用”。' :
+        'Tip: Virtualization is paused. Full history is visible, but long chats may lag. Enable it for smooth scrolling.';
+    }
+
+    if (ctrlFFreeze) {
+      return lang === 'zh' ?
+        '建议：你正在使用浏览器搜索（Ctrl+F），已自动暂停虚拟化以保证能搜到所有历史。结束搜索后会自动恢复。' :
+        'Tip: Browser Find (Ctrl+F) is active. Virtualization is paused so you can search all history. It will resume after you exit Find.';
+    }
+
+    if (autoPauseOnChat && chatBusy) {
+      return lang === 'zh' ?
+        '建议：检测到对话进行中，已临时暂停优化以避免干扰回复。对话结束后会自动继续。' :
+        'Tip: Chat is active. Optimization is temporarily paused to avoid interference. It will resume automatically after the reply finishes.';
+    }
+
+    const degraded = getDegradedHealth();
+    if (degraded.severity === 'bad' || degraded.severity === 'warn') {
+      const reasons = [];
+      if (degraded.serviceSev === 'bad' || degraded.serviceSev === 'warn') reasons.push(t('monitorService'));
+      if (degraded.ipSev === 'bad' || degraded.ipSev === 'warn') reasons.push(t('monitorIp'));
+      if (degraded.powSev === 'bad' || degraded.powSev === 'warn') reasons.push(t('monitorPow'));
+      const reasonText = reasons.join(' / ') || (lang === 'zh' ? '外部状态' : 'external signals');
+      if (degraded.severity === 'bad') {
+        return lang === 'zh' ?
+          `建议：当前${reasonText}偏危险（见下方监控）。优先点“优化”（自动选择软/硬），必要时新开对话或更换网络/IP。` :
+          `Tip: ${reasonText} looks risky (see monitor below). Tap “Optimize” (auto soft/hard). If needed, start a new chat or change network/IP.`;
+      }
+      return lang === 'zh' ?
+        `建议：当前${reasonText}偏高（见下方监控）。可继续对话，但若明显变慢，先点“优化”或稍后再试。` :
+        `Tip: ${reasonText} is elevated (see monitor below). You can continue, but if it slows down, tap Optimize or wait a bit.`;
+    }
+
+    if (mem === 'bad' || dom === 'bad') {
+      return lang === 'zh' ?
+        '建议：已接近卡顿区。优先点“优化”自动降低负载。重要内容请先备份，再考虑刷新或新开对话。' :
+        'Tip: Near lag zone. Tap “Optimize” to auto reduce load. Back up important content before refreshing or starting a new chat.';
+    }
+    if (mem === 'warn' || dom === 'warn') {
+      return lang === 'zh' ?
+        '建议：状态偏高但可继续聊。尽量别一次滚很久历史；要翻旧内容可临时切到“保守”。' :
+        'Tip: Load is higher but still OK. Avoid long scroll sessions. Switch to “Conservative” when browsing old history.';
+    }
+    if (virtCount > 0 && turns > 220) {
+      return lang === 'zh' ?
+        '建议：状态良好。找旧内容尽量用搜索或你自己的工具查看，避免反复拉到最底。' :
+        'Tip: Healthy. Use search or your own tools to view old history, instead of repeatedly scrolling to the bottom.';
+    }
+    return lang === 'zh' ? '建议：状态良好。' : 'Tip: Healthy.';
+  }
+
+  // ========================== 选择器：消息节点 ==========================
+  function getMessageNodes() {
+    const now = Date.now();
+    if (useSoftVirtualization && !msgCacheDirty && msgCache.length && msgCacheAt && (now - msgCacheAt) < MSG_CACHE_TTL_MS) {
+      return msgCache;
+    }
+
+    let nodes = document.querySelectorAll('div[data-message-id]');
+    let list = nodes && nodes.length ? Array.from(nodes) : [];
+
+    if (!list.length) {
+      nodes = document.querySelectorAll('[data-testid="conversation-turn"]');
+      list = nodes && nodes.length ? Array.from(nodes) : [];
+    }
+
+    if (!list.length) {
+      const main = document.querySelector('main');
+      if (!main) {
+        msgCache = [];
+        msgCacheDirty = false;
+        msgCacheAt = now;
+        return [];
+      }
+      nodes = main.querySelectorAll('div[role="presentation"]');
+      list = nodes && nodes.length ? Array.from(nodes) : [];
+    }
+
+    msgCache = list;
+    msgCacheDirty = false;
+    msgCacheAt = now;
+    return list;
+  }
+
+  // region: Virtualization & Interaction
+  // ========================== 虚拟化：恢复/清理 ==========================
+  function restoreHardSlim(msg) {
+    if (!msg || !msg.dataset || !msg.dataset.vsSlimmed) return;
+    msg.innerHTML = msg.dataset.vsBackup || msg.innerHTML;
+    delete msg.dataset.vsSlimmed;
+    delete msg.dataset.vsBackup;
+    delete msg.dataset.vsH;
+  }
+
+  function applyHardSlim(msg, height) {
+    if (!msg || !msg.dataset) return;
+    if (!msg.dataset.vsSlimmed) {
+      msg.dataset.vsSlimmed = '1';
+      msg.dataset.vsBackup = msg.innerHTML;
+
+      const h = Math.max(24, Math.round(Number(height) || 0));
+      msg.dataset.vsH = String(h);
+      msg.innerHTML = `<div class="cgpt-vs-ph" style="height:${h}px"></div>`;
+      return;
+    }
+    const oldH = Number(msg.dataset.vsH || 0);
+    const newH = Math.max(24, Math.round(Number(height) || 0));
+    if (oldH && Math.abs(newH - oldH) > 180) {
+      msg.dataset.vsH = String(newH);
+      const ph = msg.querySelector('.cgpt-vs-ph');
+      if (ph) ph.style.height = `${newH}px`;
+    }
+  }
+
+  function restoreHardSlimAll() {
+    const msgs = getMessageNodes();
+    for (const msg of msgs) restoreHardSlim(msg);
+  }
+
+  function unvirtualizeAll() {
+    if (useSoftVirtualization) {
+      clearSoftSlim();
+    }
+    const msgs = getMessageNodes();
+    for (const msg of msgs) {
+      restoreHardSlim(msg);
+    }
+  }
+
+  function shouldDeferHardPass(now) {
+    if (!useSoftVirtualization) return false;
+    if (!lastScrollAt) return false;
+    const idleMs = now - lastScrollAt;
+    if (idleMs > HARD_SCROLL_IDLE_MS) {
+      hardScrollDeferAt = 0;
+      return false;
+    }
+    if (!hardScrollDeferAt) hardScrollDeferAt = now;
+    if ((now - hardScrollDeferAt) < HARD_SCROLL_MAX_DEFER_MS) return true;
+    hardScrollDeferAt = 0;
+    return false;
+  }
+
+  function scheduleHardIdlePass() {
+    if (hardScrollIdleTimer) clearTimeout(hardScrollIdleTimer);
+    hardScrollIdleTimer = setTimeout(() => {
+      hardScrollIdleTimer = 0;
+      if (!virtualizationEnabled || ctrlFFreeze) return;
+      scheduleVirtualize();
+    }, HARD_SCROLL_IDLE_MS + 20);
+  }
+
+  function virtualizeOnce(marginScreensOverride) {
+    const pausedByChat = autoPauseOnChat && updateChatBusy(true);
+    if (pausedByChat) {
+      hardSliceState.active = false;
+      optimizeState.active = false;
+      return;
+    }
+
+    const now = Date.now();
+    const gateTurns = getTurnsCountCached(false) || lastTurnsCount || 0;
+
+    const margins = getDynamicMargins();
+    const softMarginScreens = (typeof marginScreensOverride === 'number') ?
+      marginScreensOverride :
+      margins.soft;
+    const hardMarginScreens = margins.hard;
+
+    const shouldHard = !useSoftVirtualization || hardActive;
+    if (!shouldHard) {
+      if (hardSliceState.active) hardSliceState.active = false;
+      optimizeState.active = false;
+      const t0 = performance.now();
+      const scrollInfo = getScrollMetrics();
+      ensureSoftObserver(softMarginScreens);
+      ensureMessageObserver();
+
+      if (!virtualizationEnabled || ctrlFFreeze) {
+        clearSoftSlim();
+        lastVirtualizedCount = 0;
+        lastTurnsCount = getTurnsCountCached(true) || 0;
+        optimizeState.active = false;
+        return;
+      }
+
+      const gate = getOptimizeGateStatusByTurns(now, gateTurns);
+      if (!gate.ready) {
+        clearSoftSlim();
+        restoreHardSlimAll();
+        lastVirtualizedCount = 0;
+        lastTurnsCount = gateTurns || 0;
+        hardSliceState.active = false;
+        optimizeState.active = false;
+        return;
+      }
+
+      scheduleSoftSync('virtualize');
+      lastVirtualizedCount = softSlimCount;
+      if (!lastTurnsCount) lastTurnsCount = getTurnsCountCached(true) || 0;
+
+      const costMs = Number((performance.now() - t0).toFixed(1));
+      logVirtualizeStats({
+        turns: lastTurnsCount,
+        slimmed: softSlimCount,
+        marginScreens: softMarginScreens,
+        costMs,
+        viewportY: Math.round(scrollInfo.top),
+        keepTop: null,
+        keepBottom: null,
+        mode: 'soft'
+      });
+      return;
+    }
+
+    if (!virtualizationEnabled || ctrlFFreeze) {
+      if (useSoftVirtualization) clearSoftSlim();
+      restoreHardSlimAll();
+      lastVirtualizedCount = 0;
+      lastTurnsCount = getTurnsCountCached(true) || 0;
+      hardSliceState.active = false;
+      optimizeState.active = false;
+      return;
+    }
+
+    const gate = getOptimizeGateStatusByTurns(now, gateTurns);
+    if (!gate.ready) {
+      if (useSoftVirtualization) clearSoftSlim();
+      restoreHardSlimAll();
+      lastVirtualizedCount = 0;
+      lastTurnsCount = gateTurns || 0;
+      hardSliceState.active = false;
+      optimizeState.active = false;
+      return;
+    }
+
+    if (useSoftVirtualization) {
+      ensureSoftObserver(softMarginScreens);
+      ensureMessageObserver();
+      scheduleSoftSync('hard');
+    }
+
+    const scrollInfo = getScrollMetrics();
+    if (hardSliceState.active) {
+      const delta = Math.abs(scrollInfo.top - hardSliceState.scrollTop);
+      if (delta > (scrollInfo.height * HARD_SLICE_RESTART_RATIO)) {
+        hardSliceState.active = false;
+      }
+      else {
+        return;
+      }
+    }
+
+    if (shouldDeferHardPass(now)) {
+      scheduleHardIdlePass();
+      setOptimizeActive(false);
+      return;
+    }
+    if (now - lastHardPassAt < HARD_PASS_MIN_MS) return;
+    lastHardPassAt = now;
+
+    const t0 = performance.now();
+
+    const msgs = getMessageNodes();
+    const turns = msgs.length;
+    const viewportTop = scrollInfo.top;
+    const viewportBottom = viewportTop + scrollInfo.height;
+
+    const softKeepTop = viewportTop - scrollInfo.height * softMarginScreens;
+    const softKeepBottom = viewportBottom + scrollInfo.height * softMarginScreens;
+    const hardKeepTop = viewportTop - scrollInfo.height * hardMarginScreens;
+    const hardKeepBottom = viewportBottom + scrollInfo.height * hardMarginScreens;
+    const rootRect = (!scrollInfo.isWindow && scrollInfo.root) ? scrollInfo.root.getBoundingClientRect() : null;
+
+    // Time-sliced hard virtualization to reduce long main-thread stalls on huge chats.
+    if (turns >= HARD_SLICE_TURNS) {
+      const token = hardSliceState.token + 1;
+      hardSliceState = {
+        active: true,
+        token,
+        index: 0,
+        total: turns,
+        startAt: t0,
+        scrollTop: viewportTop,
+        viewportH: scrollInfo.height,
+        steps: 0,
+        lastStepAt: Date.now(),
+        msgs,
+        scrollInfo,
+        rootRect,
+        softKeepTop,
+        softKeepBottom,
+        hardKeepTop,
+        hardKeepBottom,
+        softMarginScreens,
+        hardMarginScreens,
+        hardSlimmedCount: 0,
+        nextSoftCount: 0
+      };
+
+      const slice = () => {
+        if (!hardSliceState.active || hardSliceState.token !== token) return;
+        const start = performance.now();
+        hardSliceState.steps += 1;
+        hardSliceState.lastStepAt = Date.now();
+        setOptimizeActive(true);
+        const hardSlimTargets = [];
+        const hardRestoreTargets = [];
+        const softAddTargets = [];
+        const softRemoveTargets = [];
+        let processed = 0;
+        const remaining = Math.max(0, hardSliceState.total - hardSliceState.index);
+        const remainingRatio = hardSliceState.total ? (remaining / hardSliceState.total) : 0;
+        const budgetMs = getHardSliceBudget(remainingRatio, hardSliceState.steps);
+
+        while (hardSliceState.index < hardSliceState.total) {
+          const msg = hardSliceState.msgs[hardSliceState.index];
+          hardSliceState.index += 1;
+          if (!msg || !msg.getBoundingClientRect) continue;
+          processed += 1;
+          const rect = msg.getBoundingClientRect();
+          const top = hardSliceState.scrollInfo.isWindow
+            ? (rect.top + window.scrollY)
+            : (rect.top - hardSliceState.rootRect.top + hardSliceState.scrollInfo.root.scrollTop);
+          const bottom = top + rect.height;
+          const inHard = bottom > hardSliceState.hardKeepTop && top < hardSliceState.hardKeepBottom;
+
+          if (!inHard) {
+            if (useSoftVirtualization && msg.classList.contains(VS_SLIM_CLASS)) {
+              softRemoveTargets.push(msg);
+            }
+            hardSlimTargets.push({ msg, height: rect.height });
+            hardSliceState.hardSlimmedCount += 1;
+          }
+          else {
+            if (msg.dataset.vsSlimmed) hardRestoreTargets.push(msg);
+            if (useSoftVirtualization) {
+              const inSoft = bottom > hardSliceState.softKeepTop && top < hardSliceState.softKeepBottom;
+              const shouldSoftSlim = !inSoft;
+              const hasSoft = msg.classList.contains(VS_SLIM_CLASS);
+              if (shouldSoftSlim) {
+                hardSliceState.nextSoftCount += 1;
+                if (!hasSoft) softAddTargets.push(msg);
+              }
+              else if (hasSoft) {
+                softRemoveTargets.push(msg);
+              }
+            }
+          }
+
+          if (processed >= HARD_SLICE_MAX_ITEMS) break;
+          if (processed >= HARD_SLICE_MIN_ITEMS && (performance.now() - start) > budgetMs) break;
+        }
+
+        for (const msg of hardRestoreTargets) restoreHardSlim(msg);
+        if (useSoftVirtualization) {
+          for (const msg of softRemoveTargets) msg.classList.remove(VS_SLIM_CLASS);
+        }
+        for (const item of hardSlimTargets) applyHardSlim(item.msg, item.height);
+        if (useSoftVirtualization) {
+          for (const msg of softAddTargets) msg.classList.add(VS_SLIM_CLASS);
+        }
+
+        if (hardSliceState.index < hardSliceState.total) {
+          markOptimizeWork();
+          if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(slice, { timeout: 200 });
+          }
+          else {
+            setTimeout(slice, 0);
+          }
+          return;
+        }
+
+        const costMs = Number((performance.now() - hardSliceState.startAt).toFixed(1));
+        lastTurnsCount = turns;
+        if (useSoftVirtualization) softSlimCount = hardSliceState.nextSoftCount;
+        lastVirtualizedCount = useSoftVirtualization ? (softSlimCount + hardSliceState.hardSlimmedCount) : hardSliceState.hardSlimmedCount;
+        hardSliceState.active = false;
+        setOptimizeActive(false);
+        logVirtualizeStats({
+          turns,
+          slimmed: hardSliceState.hardSlimmedCount,
+          marginScreens: hardMarginScreens,
+          softMarginScreens,
+          hardMarginScreens,
+          costMs,
+          viewportY: Math.round(viewportTop),
+          keepTop: Math.round(hardKeepTop),
+          keepBottom: Math.round(hardKeepBottom),
+          mode: 'hard'
+        });
+      };
+
+      slice();
+      return;
+    }
+
+    setOptimizeActive(true);
+    let hardSlimmedCount = 0;
+    let nextSoftCount = 0;
+    const hardSlimTargets = [];
+    const hardRestoreTargets = [];
+    const softAddTargets = [];
+    const softRemoveTargets = [];
+
+    for (const msg of msgs) {
+      const rect = msg.getBoundingClientRect();
+      const top = scrollInfo.isWindow ? (rect.top + window.scrollY) : (rect.top - rootRect.top + scrollInfo.root.scrollTop);
+      const bottom = top + rect.height;
+      const inHard = bottom > hardKeepTop && top < hardKeepBottom;
+
+      if (!inHard) {
+        if (useSoftVirtualization && msg.classList.contains(VS_SLIM_CLASS)) {
+          softRemoveTargets.push(msg);
+        }
+        hardSlimTargets.push({ msg, height: rect.height });
+        hardSlimmedCount += 1;
+        continue;
+      }
+
+      if (msg.dataset.vsSlimmed) hardRestoreTargets.push(msg);
+      if (useSoftVirtualization) {
+        const inSoft = bottom > softKeepTop && top < softKeepBottom;
+        const shouldSoftSlim = !inSoft;
+        const hasSoft = msg.classList.contains(VS_SLIM_CLASS);
+        if (shouldSoftSlim) {
+          nextSoftCount += 1;
+          if (!hasSoft) softAddTargets.push(msg);
+        }
+        else if (hasSoft) {
+          softRemoveTargets.push(msg);
+        }
+      }
+    }
+
+    // Batch DOM writes after all reads to avoid layout thrash.
+    for (const msg of hardRestoreTargets) restoreHardSlim(msg);
+    if (useSoftVirtualization) {
+      for (const msg of softRemoveTargets) msg.classList.remove(VS_SLIM_CLASS);
+    }
+    for (const item of hardSlimTargets) applyHardSlim(item.msg, item.height);
+    if (useSoftVirtualization) {
+      for (const msg of softAddTargets) msg.classList.add(VS_SLIM_CLASS);
+    }
+
+    const costMs = Number((performance.now() - t0).toFixed(1));
+    lastTurnsCount = turns;
+    if (useSoftVirtualization) softSlimCount = nextSoftCount;
+    lastVirtualizedCount = useSoftVirtualization ? (softSlimCount + hardSlimmedCount) : hardSlimmedCount;
+    setOptimizeActive(false);
+    logVirtualizeStats({
+      turns,
+      slimmed: hardSlimmedCount,
+      marginScreens: hardMarginScreens,
+      softMarginScreens,
+      hardMarginScreens,
+      costMs,
+      viewportY: Math.round(viewportTop),
+      keepTop: Math.round(hardKeepTop),
+      keepBottom: Math.round(hardKeepBottom),
+      mode: 'hard'
+    });
+  }
+
+  function scheduleVirtualize(marginOverride) {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      virtualizeOnce(marginOverride);
+      updateUI();
+    });
+  }
+
+  // ========================== Ctrl+F 兼容 ==========================
+  function enableCtrlFFreeze() {
+    if (ctrlFFreeze) return;
+    ctrlFFreeze = true;
+    unvirtualizeAll();
+    updateUI();
+    logEvent('info', 'ctrlF.on', {
+      turns: getMessageNodes().length || 0
+    });
+  }
+
+  function disableCtrlFFreeze() {
+    if (!ctrlFFreeze) return;
+    ctrlFFreeze = false;
+    scheduleVirtualize();
+    logEvent('info', 'ctrlF.off');
+  }
+
+  function installFindGuards() {
+    window.addEventListener('keydown', (e) => {
+      const isFind = ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F'));
+      if (isFind) enableCtrlFFreeze();
+      if (e.key === 'Escape') setTimeout(() => disableCtrlFFreeze(), 120);
+    }, true);
+  }
+
+  // ========================== 输入淡出 ==========================
+  function installTypingDim() {
+    const dim = () => {
+      lastInputAt = Date.now();
+      const root = ensureRoot();
+      root.classList.add('dim');
+      if (typingDimTimer) clearTimeout(typingDimTimer);
+      typingDimTimer = setTimeout(() => {
+        const idle = Date.now() - lastInputAt;
+        if (idle >= INPUT_DIM_IDLE_MS) root.classList.remove('dim');
+      }, INPUT_DIM_IDLE_MS + 20);
+    };
+
+    document.addEventListener('input', (e) => {
+      if (!e || !e.target) return;
+      const el = e.target;
+      const tag = (el.tagName || '').toLowerCase();
+      if (tag === 'textarea' || tag === 'input') dim();
+    }, true);
+
+    document.addEventListener('focusin', (e) => {
+      const el = e.target;
+      if (!el) return;
+      const tag = (el.tagName || '').toLowerCase();
+      if (tag === 'textarea' || tag === 'input') dim();
+    }, true);
+
+    document.addEventListener('focusout', () => {
+      setTimeout(() => {
+        const root = ensureRoot();
+        root.classList.remove('dim');
+      }, 220);
+    }, true);
+  }
+
+  // ========================== 图片加载后补一次 ==========================
+  function installImageLoadHook() {
+    window.addEventListener('load', (e) => {
+      const t = e && e.target;
+      if (t && t.tagName && t.tagName.toLowerCase() === 'img') {
+        if (useSoftVirtualization) {
+          const msg = t.closest('div[data-message-id], [data-testid="conversation-turn"], div[role="presentation"]');
+          if (msg) {
+            setIntrinsicSize(msg, msg.getBoundingClientRect().height);
+          }
+        }
+        setTimeout(() => scheduleVirtualize(), IMAGE_LOAD_RETRY_MS);
+      }
+    }, true);
+  }
+
+  // ========================== Resize 修复 ==========================
+  function installResizeFix() {
+    window.addEventListener('resize', () => {
+      unvirtualizeAll();
+      requestAnimationFrame(() => scheduleVirtualize());
+      logEvent('debug', 'resize', {
+        w: window.innerWidth,
+        h: window.innerHeight
+      });
+    }, {
+      passive: true
+    });
+  }
+
+  // ========================== 跟随“模型切换按钮”定位 ==========================
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    return true;
+  }
+
+  function getMainContentLeft() {
+    const main = document.querySelector('main');
+    if (main) {
+      const rect = main.getBoundingClientRect();
+      if (rect.width && rect.right > rect.left) return rect.left;
+    }
+    const mainLike = document.querySelector('[data-testid="conversation"], [data-testid="chat-view"], [data-testid="app-main"]');
+    if (mainLike) {
+      const rect = mainLike.getBoundingClientRect();
+      if (rect.width && rect.right > rect.left) return rect.left;
+    }
+    let sidebarRight = 0;
+    document.querySelectorAll('nav, aside, [data-testid*="sidebar"], [data-testid*="left-rail"], [data-testid*="navigation"]').forEach((el) => {
+      if (!isElementVisible(el)) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 40 && rect.right > sidebarRight) sidebarRight = rect.right;
+    });
+    return sidebarRight ? (sidebarRight + 1) : 0;
+  }
+
+  function getElementLabel(el) {
+    if (!el) return '';
+    const label = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+    if (label) return label;
+    return (el.textContent || '').trim();
+  }
+
+  function isLikelyModelLabel(text) {
+    if (!text) return false;
+    const t = text.trim();
+    if (!t || t.length > 80) return false;
+    return /gpt|chatgpt|model|模型|4o|o1|o3|o4|mini|turbo|preview|pro|builder|prompt/i.test(t);
+  }
+
+  function resolveButtonCandidate(el) {
+    if (!el) return null;
+    if (el.closest && el.closest('#' + ROOT_ID)) return null;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (el.tagName === 'BUTTON' || role === 'button') return el;
+    const inner = el.querySelector ? el.querySelector('button, [role="button"]') : null;
+    return inner || null;
+  }
+
+  function scoreModelCandidate(el, mainLeft) {
+    if (!isElementVisible(el)) return Infinity;
+    const rect = el.getBoundingClientRect();
+    let score = (rect.top * 6) + rect.left;
+    if (el.closest && el.closest('header')) score -= 140;
+    if (el.closest && el.closest('main')) score -= 60;
+    if (el.closest && el.closest('nav, aside')) score += 900;
+    if (mainLeft && rect.right < (mainLeft - 6)) score += 1200;
+    if (rect.top > 180) score += 600;
+    if (rect.top < 0) score += 300;
+    const label = getElementLabel(el).toLowerCase();
+    if (label) {
+      if (/(?:^|\\b)(?:o1|o3|o4|4o|mini|turbo|preview|pro)(?:\\b|$)/i.test(label)) score -= 140;
+      if (/gpt|chatgpt|model|模型/i.test(label)) score -= 80;
+      if (/builder|prompt/i.test(label)) score -= 40;
+    }
+    if (rect.width > 520) score += 200;
+    if (rect.width < 240) score -= 40;
+    return score;
+  }
+
+  function pickBestModelCandidate(list, mainLeft) {
+    const seen = new Set();
+    let best = null;
+    let bestScore = Infinity;
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    for (const item of list) {
+      if (!item || seen.has(item)) continue;
+      seen.add(item);
+      const score = scoreModelCandidate(item, ml);
+      if (score < bestScore) {
+        bestScore = score;
+        best = item;
+      }
+    }
+    return best;
+  }
+
+  function collectModelButtonCandidates(mainLeft) {
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    const selectors = [
+      '[data-testid*="model"]',
+      '[data-testid*="model-switcher"]',
+      '[data-testid*="model_switcher"]',
+      '[data-testid*="model-switch"]',
+      'button[aria-label*="Model"]',
+      'button[aria-label*="模型"]',
+      'button[title*="Model"]',
+      'button[title*="模型"]',
+      '[role="button"][aria-label*="Model"]',
+      '[role="button"][aria-label*="模型"]'
+    ];
+    const candidates = [];
+    selectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((el) => {
+        const btn = resolveButtonCandidate(el);
+        if (!btn) return;
+        if (!isElementVisible(btn)) return;
+        if (ml && btn.getBoundingClientRect().right < (ml - 6)) return;
+        candidates.push(btn);
+      });
+    });
+    return candidates;
+  }
+
+  function collectTopBarTextCandidates(mainLeft) {
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    const topLimit = 140;
+    const list = [];
+    document.querySelectorAll('button, [role="button"]').forEach((el) => {
+      if (!isElementVisible(el)) return;
+      if (el.closest && el.closest('#' + ROOT_ID)) return;
+      if (el.closest && el.closest('nav, aside')) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.top > topLimit) return;
+      if (ml && rect.right < (ml - 6)) return;
+      const label = ((el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '')).trim();
+      if (!label) return;
+      if (!/gpt|chatgpt|model|switch|o1|o3|o4|4o|mini|turbo|preview|pro/i.test(label)) return;
+      list.push(el);
+    });
+    return list;
+  }
+
+  function collectModelLabelAnchors(mainLeft) {
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    const selectors = [
+      'main h1',
+      'main h2',
+      'main h3',
+      'main [role="heading"]',
+      'main [data-testid*="title"]',
+      'main [data-testid*="model"]',
+      'header h1',
+      'header h2',
+      'header h3',
+      'header [role="heading"]',
+      'header [data-testid*="title"]',
+      'header [data-testid*="model"]'
+    ];
+    const list = [];
+    selectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (!isElementVisible(el)) return;
+        if (el.closest && el.closest('#' + ROOT_ID)) return;
+        if (el.closest && el.closest('nav, aside')) return;
+        const rect = el.getBoundingClientRect();
+        if (rect.top > 160 || rect.height > 80) return;
+        if (ml && rect.right < (ml - 6)) return;
+        const label = getElementLabel(el);
+        if (!isLikelyModelLabel(label)) return;
+        list.push(el);
+      });
+    });
+    return list;
+  }
+
+  function findModelButton() {
+    const now = Date.now();
+    if (modelBtnCache.el && (now - modelBtnCache.at) < MODEL_BTN_TTL_MS) {
+      if (isElementVisible(modelBtnCache.el)) return modelBtnCache.el;
+    }
+
+    const mainLeft = getMainContentLeft();
+    const candidates = collectModelButtonCandidates(mainLeft)
+      .concat(collectTopBarTextCandidates(mainLeft))
+      .concat(collectModelLabelAnchors(mainLeft));
+    let best = pickBestModelCandidate(candidates, mainLeft);
+    if (best) {
+      modelBtnCache = { el: best, at: now };
+      return best;
+    }
+
+    const header = document.querySelector('header');
+    if (!header) return null;
+
+    const btns = header.querySelectorAll('button, [role="button"]');
+    const headerCandidates = [];
+    for (const b of btns) {
+      const txt = ((b.innerText || b.textContent || '')).trim();
+      if (!txt) continue;
+
+      const hit =
+        /chatgpt/i.test(txt) ||
+        /\bgpt\b/i.test(txt) ||
+        txt.includes('模型') ||
+        txt.includes('切换') ||
+        txt.includes('ChatGPT');
+
+      if (hit) headerCandidates.push(b);
+    }
+
+    best = pickBestModelCandidate(headerCandidates, mainLeft);
+    modelBtnCache = { el: best || null, at: now };
+    return best;
+  }
+
+  function positionNearModelButton() {
+    const root = ensureRoot();
+    if (pinned) return;
+
+    const btn = findModelButton();
+    if (!btn) {
+      root.style.left = '12px';
+      root.style.top = `${10 + FLOAT_Y_OFFSET_PX}px`;
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+      root.classList.add('fallback');
+      return;
+    }
+
+    const r = btn.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const rootW = Math.max(200, Math.round(rootRect.width || 0));
+    const rootH = Math.max(24, Math.round(rootRect.height || 0));
+    const gap = 8;
+    let x = Math.round(r.right + gap);
+    const leftX = Math.round(r.left - rootW - gap);
+    if ((x + rootW > window.innerWidth - 6) && leftX >= 6) {
+      x = leftX;
+    }
+    const baseY = Math.round(r.top + (r.height - rootH) / 2);
+    const y = Math.max(6, baseY + FLOAT_Y_OFFSET_PX);
+
+    root.style.left = `${clamp(x, 6, window.innerWidth - rootW - 6)}px`;
+    root.style.top = `${clamp(y, 6, window.innerHeight - rootH - 6)}px`;
+    root.style.right = 'auto';
+    root.style.bottom = 'auto';
+
+    root.classList.remove('fallback');
+  }
+
+  function startFollowPositionLoop() {
+    stopFollowPositionLoop();
+    if (pinned) return;
+    const tick = () => {
+      if (pinned) {
+        stopFollowPositionLoop();
+        return;
+      }
+      const root = ensureRoot();
+      const open = root.classList.contains('open');
+      positionNearModelButton();
+      followTimer = setTimeout(tick, open ? POS_FOLLOW_WHEN_OPEN_MS : POS_FOLLOW_MS);
+    };
+    tick();
+  }
+
+  function stopFollowPositionLoop() {
+    if (followTimer) clearTimeout(followTimer);
+    followTimer = null;
+  }
+
+  // ========================== Feature Pack：Token ==========================
+  function estimateTokens() {
+    const nodes = getMessageNodes();
+    const scratch = document.createElement('div');
+    let total = 0;
+    for (const node of nodes) {
+      let chunk = '';
+      const backup = node?.dataset?.vsSlimmed ? node?.dataset?.vsBackup : '';
+      if (backup) {
+        scratch.innerHTML = backup;
+        chunk = scratch.innerText || '';
+      }
+      else {
+        chunk = node.innerText || '';
+      }
+      total += chunk.length;
+    }
+    return Math.round(total / 4);
+  }
+
+  // ========================== UI：主题适配 ==========================
+  function isDarkTheme() {
+    const docEl = document.documentElement;
+    const body = document.body;
+    const docTheme = (docEl.getAttribute('data-theme') || '').toLowerCase();
+    const bodyTheme = body ? (body.getAttribute('data-theme') || '').toLowerCase() : '';
+    return docEl.classList.contains('dark') ||
+      (body && body.classList.contains('dark')) ||
+      docTheme === 'dark' ||
+      bodyTheme === 'dark';
+  }
+
+  function applyThemeClass() {
+    const dark = isDarkTheme();
+    const root = document.getElementById(ROOT_ID);
+    const help = document.getElementById(HELP_ID);
+    if (root) root.classList.toggle('theme-dark', dark);
+    if (help) help.classList.toggle('theme-dark', dark);
+  }
+
+  function ensureThemeObservation() {
+    if (!themeObserver) return;
+    const body = document.body;
+    if (!body || body === themeObservedBody) return;
+    themeObservedBody = body;
+    themeObserver.observe(body, {
+      attributes: true,
+      attributeFilter: ['class', 'data-theme']
+    });
+  }
+
+  function startThemeObserver() {
+    if (themeObserver) return;
+    themeObserver = new MutationObserver(() => applyThemeClass());
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'data-theme']
+    });
+    ensureThemeObservation();
+    setTimeout(() => {
+      ensureThemeObservation();
+      applyThemeClass();
+    }, 0);
+  }
+
+  // endregion: Virtualization & Interaction
+  // region: UI Render & Bindings
+  // ========================== UI：注入样式 ==========================
+  function injectStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${ROOT_ID}{
+        position: fixed;
+        z-index: 2147483647;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        user-select: none;
+        -webkit-user-select: none;
+        --cgpt-glass-blur: 20px;
+        --cgpt-glass-sat: 1.28;
+        --cgpt-glass-panel: rgba(255,255,255,0.72);
+        --cgpt-glass-panel-2: rgba(255,255,255,0.46);
+        --cgpt-glass-card: rgba(255,255,255,0.62);
+        --cgpt-glass-card-2: rgba(255,255,255,0.38);
+        --cgpt-glass-chip: rgba(255,255,255,0.66);
+        --cgpt-glass-chip-2: rgba(255,255,255,0.44);
+        --cgpt-glass-border: rgba(255,255,255,0.55);
+        --cgpt-glass-border-strong: rgba(255,255,255,0.75);
+        --cgpt-glass-highlight: rgba(255,255,255,0.75);
+        --cgpt-glass-highlight-strong: rgba(255,255,255,0.92);
+        --cgpt-glass-shadow: 0 22px 60px rgba(15,23,42,0.16);
+        --cgpt-glass-shadow-soft: 0 12px 28px rgba(15,23,42,0.08);
+        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.78);
+        transform: translateZ(0);
+        opacity: 1;
+        transition: opacity 160ms ease;
+      }
+      #${ROOT_ID}.dim{ opacity: 0.2; }
+      #${ROOT_ID}.fallback{ filter: saturate(1.02); }
+
+      .${VS_SLIM_CLASS}{
+        content-visibility: auto;
+        contain-intrinsic-size: 1px var(--cgpt-vs-h, 160px);
+      }
+
+      #${BTN_ID}{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        height: 28px;
+        padding: 0 10px;
+        border-radius: 999px;
+        border: 1px solid var(--cgpt-glass-border);
+        background: var(--cgpt-glass-chip);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft);
+        cursor: pointer;
+        font-size: 12px;
+        color: rgba(0,0,0,0.78);
+      }
+      #${BTN_ID}:hover{ background: rgba(255,255,255,0.92); }
+      #${STATUS_TEXT_ID}{
+        max-width: 220px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        opacity: 0.9;
+      }
+      #${BTN_ID} .cgpt-vs-miniTags{
+        margin-left: auto;
+        display:flex;
+        align-items:center;
+        gap:6px;
+      }
+      #${BTN_ID} .cgpt-vs-miniItem{
+        position: relative;
+        min-width: 24px;
+        height: 18px;
+        padding: 0 6px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.7);
+        background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        gap:4px;
+        font-size: 10px;
+        font-weight: 800;
+        color: rgba(0,0,0,0.72);
+        backdrop-filter: blur(18px) saturate(1.35);
+        -webkit-backdrop-filter: blur(18px) saturate(1.35);
+        box-shadow:
+          0 8px 18px rgba(0,0,0,0.08),
+          inset 0 1px 0 rgba(255,255,255,0.75),
+          inset 0 -1px 0 rgba(255,255,255,0.25);
+        overflow: hidden;
+      }
+      #${BTN_ID} .cgpt-vs-miniItem > *{
+        position: relative;
+        z-index: 1;
+      }
+      #${BTN_ID} .cgpt-vs-miniItem::before{
+        content: '';
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.75), rgba(255,255,255,0.08) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.45), rgba(255,255,255,0.0));
+        opacity: 0.7;
+        pointer-events: none;
+        z-index: 0;
+      }
+      #${BTN_ID} .cgpt-vs-miniDot{
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #22c55e;
+        box-shadow:
+          0 0 0 2px rgba(34,197,94,0.22),
+          inset 0 1px 1px rgba(255,255,255,0.6);
+      }
+      #${BTN_ID} .cgpt-vs-miniText{
+        max-width: 90px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #${BTN_ID} .cgpt-vs-statusPill .cgpt-vs-miniText{
+        max-width: 140px;
+      }
+      #${BTN_ID} .cgpt-vs-statusPill.ok{
+        border-color: rgba(16,185,129,0.6);
+        background: linear-gradient(140deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08));
+        color: #065f46;
+        box-shadow:
+          0 10px 22px rgba(16,185,129,0.18),
+          inset 0 1px 0 rgba(255,255,255,0.6);
+      }
+      #${BTN_ID} .cgpt-vs-statusPill.warn{
+        border-color: rgba(245,158,11,0.62);
+        background: linear-gradient(140deg, rgba(245,158,11,0.22), rgba(245,158,11,0.08));
+        color: #92400e;
+        box-shadow:
+          0 10px 22px rgba(245,158,11,0.18),
+          inset 0 1px 0 rgba(255,255,255,0.55);
+      }
+      #${BTN_ID} .cgpt-vs-statusPill.bad{
+        border-color: rgba(239,68,68,0.65);
+        background: linear-gradient(140deg, rgba(239,68,68,0.22), rgba(239,68,68,0.08));
+        color: #991b1b;
+        box-shadow:
+          0 10px 22px rgba(239,68,68,0.2),
+          inset 0 1px 0 rgba(255,255,255,0.45);
+      }
+      #${BTN_ID} .cgpt-vs-statusPill.off{
+        border-color: rgba(107,114,128,0.55);
+        background: linear-gradient(140deg, rgba(107,114,128,0.22), rgba(107,114,128,0.08));
+        color: #374151;
+        box-shadow:
+          0 10px 22px rgba(107,114,128,0.16),
+          inset 0 1px 0 rgba(255,255,255,0.4);
+      }
+      #${BTN_ID} .cgpt-vs-miniItem.pause{
+        border-color: rgba(245,158,11,0.6);
+        background: linear-gradient(140deg, rgba(245,158,11,0.22), rgba(245,158,11,0.08));
+        color: #92400e;
+        box-shadow:
+          0 10px 22px rgba(245,158,11,0.18),
+          inset 0 1px 0 rgba(255,255,255,0.55);
+      }
+      #${BTN_ID} .cgpt-vs-miniItem.optimizing{
+        animation: cgpt-vs-pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes cgpt-vs-pulse{
+        0%{ transform: translateZ(0) scale(1); }
+        50%{ transform: translateZ(0) scale(1.04); }
+        100%{ transform: translateZ(0) scale(1); }
+      }
+
+      #${DOT_ID}{
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #22c55e;
+        box-shadow: 0 0 0 2px rgba(34,197,94,0.18);
+        transition: transform 140ms ease;
+      }
+      #${DOT_ID}.warn{
+        background: #f59e0b;
+        box-shadow: 0 0 0 2px rgba(245,158,11,0.18);
+      }
+      #${DOT_ID}.bad{
+        background: #ef4444;
+        box-shadow: 0 0 0 2px rgba(239,68,68,0.18);
+      }
+      #${DOT_ID}.off{
+        background: rgba(0,0,0,0.36);
+        box-shadow: 0 0 0 2px rgba(0,0,0,0.12);
+      }
+
+      #${PANEL_ID}{
+        position: relative;
+        overflow: hidden;
+        margin-top: 14px;
+        width: 640px;
+        max-width: min(720px, calc(100vw - 16px));
+        padding: 12px;
+        border-radius: 16px;
+        border: 1px solid var(--cgpt-glass-border-strong);
+        background: linear-gradient(135deg, var(--cgpt-glass-panel), var(--cgpt-glass-panel-2));
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow), var(--cgpt-glass-inset);
+        display: none;
+        color: rgba(0,0,0,0.86);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      #${ROOT_ID}.open #${PANEL_ID}{ display:block; }
+      #${PANEL_ID},
+      .cgpt-vs-org,
+      .cgpt-vs-deg,
+      .cgpt-vs-seg,
+      .cgpt-vs-helpCard{
+        position: relative;
+        isolation: isolate;
+      }
+      #${PANEL_ID}::before,
+      .cgpt-vs-org::before,
+      .cgpt-vs-deg::before,
+      .cgpt-vs-seg::before,
+      .cgpt-vs-helpCard::before{
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: radial-gradient(140% 100% at 0% 0%, var(--cgpt-glass-highlight-strong, rgba(255,255,255,0.9)), rgba(255,255,255,0) 70%);
+        opacity: 0.65;
+        pointer-events: none;
+        z-index: 0;
+      }
+      #${PANEL_ID}::after,
+      .cgpt-vs-org::after,
+      .cgpt-vs-deg::after,
+      .cgpt-vs-seg::after,
+      .cgpt-vs-helpCard::after{
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(135deg, rgba(255,255,255,0.18), rgba(255,255,255,0.0) 48%, rgba(255,255,255,0.1));
+        opacity: 0.55;
+        pointer-events: none;
+        z-index: 0;
+      }
+      #${PANEL_ID} > *,
+      .cgpt-vs-org > *,
+      .cgpt-vs-deg > *,
+      .cgpt-vs-seg > *,
+      .cgpt-vs-helpCard > *{
+        position: relative;
+        z-index: 1;
+      }
+      .cgpt-vs-chip,
+      .cgpt-vs-topTag,
+      .cgpt-vs-deg-tag,
+      .cgpt-vs-deg-badge,
+      .cgpt-vs-seg button.active{
+        position: relative;
+      }
+      .cgpt-vs-chip::before,
+      .cgpt-vs-topTag::before,
+      .cgpt-vs-deg-tag::before,
+      .cgpt-vs-deg-badge::before,
+      .cgpt-vs-seg button.active::before{
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(140deg, var(--cgpt-glass-highlight, rgba(255,255,255,0.7)), rgba(255,255,255,0) 60%);
+        opacity: 0.6;
+        pointer-events: none;
+        z-index: 0;
+      }
+
+      .cgpt-vs-toprow{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        margin-bottom: 8px;
+      }
+
+      .cgpt-vs-sectionTitle{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        font-weight: 800;
+        font-size: 12px;
+        letter-spacing: 0.2px;
+        color: rgba(0,0,0,0.72);
+      }
+      .cgpt-vs-org,
+      .cgpt-vs-organism{
+        margin-top: 8px;
+        padding: 10px;
+        border-radius: 14px;
+        border: 1px solid var(--cgpt-glass-border-strong);
+        background: linear-gradient(145deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-org:first-of-type{ margin-top: 0; }
+      /* Atomic Design: Atoms */
+      .cgpt-vs-atom{
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+      }
+      .cgpt-vs-actionsGrid{
+        display:grid;
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .cgpt-vs-layout,
+      .cgpt-vs-template-body{
+        margin-top: 8px;
+        display:grid;
+        grid-template-columns: minmax(280px, 1.1fr) minmax(220px, 0.9fr);
+        gap: 10px;
+        align-items: stretch;
+      }
+      .cgpt-vs-col-left,
+      .cgpt-vs-col-right{
+        display:flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .cgpt-vs-col-left{ min-height: 100%; }
+      .cgpt-vs-org-mood{
+        flex: 1;
+        min-height: 0;
+        display:flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 6px;
+        text-align: left;
+      }
+      .cgpt-vs-moodText{
+        font-size: 12px;
+        font-weight: 700;
+        color: rgba(0,0,0,0.78);
+      }
+      .cgpt-vs-moodSub{
+        font-size: 11px;
+        color: rgba(0,0,0,0.6);
+      }
+      .cgpt-vs-template-slot{ min-width: 0; }
+      @media (max-width: 720px){
+        .cgpt-vs-layout{
+          grid-template-columns: 1fr;
+        }
+      }
+      .cgpt-vs-org-status{ padding-bottom: 8px; }
+      .cgpt-vs-statusBar{
+        display:flex;
+        align-items:flex-start;
+        justify-content:space-between;
+        gap:8px;
+      }
+      .cgpt-vs-statusMain{
+        display:flex;
+        flex-direction:column;
+        gap:2px;
+        min-width: 0;
+      }
+      .cgpt-vs-statusText{
+        font-weight: 800;
+        font-size: 13px;
+        color: rgba(0,0,0,0.82);
+      }
+      .cgpt-vs-statusReason{
+        font-size: 11px;
+        color: rgba(0,0,0,0.58);
+      }
+      .cgpt-vs-topTags{
+        display:flex;
+        align-items:center;
+        gap:6px;
+        flex-wrap: wrap;
+        justify-content:flex-end;
+      }
+      .cgpt-vs-topTag{
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid var(--cgpt-glass-border);
+        background: linear-gradient(140deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        display:inline-flex;
+        align-items:center;
+        font-weight: 800;
+        font-size: 11px;
+        color: rgba(0,0,0,0.76);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-topTag.pause{
+        border-color: rgba(245,158,11,0.6);
+        background: linear-gradient(140deg, rgba(245,158,11,0.26), rgba(245,158,11,0.12));
+        color: #92400e;
+      }
+      .cgpt-vs-mol-group{ margin-top: 8px; }
+      .cgpt-vs-groupTitle{
+        font-weight: 800;
+        font-size: 11px;
+        color: rgba(0,0,0,0.66);
+        margin-bottom: 4px;
+      }
+
+      .cgpt-vs-seg{
+        display:flex;
+        align-items:center;
+        width: 100%;
+        padding: 3px;
+        border-radius: 999px;
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        border: 1px solid var(--cgpt-glass-border-strong);
+        box-shadow: var(--cgpt-glass-inset), var(--cgpt-glass-shadow-soft);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+      }
+      .cgpt-vs-seg button{
+        flex:1;
+        height: 28px;
+        border: 0;
+        background: transparent;
+        border-radius: 999px;
+        cursor: pointer;
+        font-size: 12px;
+        color: rgba(0,0,0,0.62);
+        transition: background 140ms ease, box-shadow 140ms ease, color 140ms ease;
+      }
+      .cgpt-vs-seg button.active{
+        background: linear-gradient(150deg, var(--cgpt-glass-panel), var(--cgpt-glass-panel-2));
+        color: rgba(0,0,0,0.86);
+        box-shadow: 0 10px 22px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.7);
+      }
+
+      /* ✅ 5.0 UI：控件区允许换行，避免挤爆 */
+      .cgpt-vs-controls{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+      .cgpt-vs-mol-group .cgpt-vs-controls{ margin-top: 6px; }
+      .cgpt-vs-controls.cgpt-vs-ops{ align-items:center; }
+      .cgpt-vs-ops .cgpt-vs-chiprow{ justify-content:flex-start; }
+      .cgpt-vs-controls.cgpt-vs-flags{ margin-top: 6px; }
+      .cgpt-vs-flags .cgpt-vs-chiprow{ justify-content:flex-start; }
+      .cgpt-vs-chiprow{
+        display:flex;
+        gap:8px;
+        flex-wrap: wrap;
+        justify-content:flex-end;
+      }
+      .cgpt-vs-chippair{
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        flex-wrap: nowrap;
+        white-space: nowrap;
+      }
+      .cgpt-vs-chip{
+        height: 28px;
+        padding: 0 10px;
+        border-radius: 999px;
+        border: 1px solid var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        cursor: pointer;
+        font-size: 12px;
+        color: rgba(0,0,0,0.78);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-chip:hover{ background: linear-gradient(145deg, rgba(255,255,255,0.94), rgba(255,255,255,0.7)); }
+      .cgpt-vs-chip.primary{
+        border-color: var(--cgpt-glass-border-strong);
+        font-weight: 600;
+      }
+      .cgpt-vs-chip.danger{
+        border-color: rgba(239,68,68,0.45);
+        color: #b91c1c;
+        background: linear-gradient(145deg, rgba(239,68,68,0.18), rgba(239,68,68,0.08));
+        box-shadow: 0 10px 20px rgba(239,68,68,0.18), inset 0 1px 0 rgba(255,255,255,0.45);
+        font-weight: 600;
+      }
+      .cgpt-vs-chip.active{
+        border-color: rgba(16,185,129,0.55);
+        background: linear-gradient(145deg, rgba(16,185,129,0.26), rgba(16,185,129,0.12));
+        color: #065f46;
+        box-shadow: 0 12px 24px rgba(16,185,129,0.22), inset 0 1px 0 rgba(255,255,255,0.5);
+        font-weight: 700;
+      }
+      .cgpt-vs-chip.paused{
+        border-color: rgba(245,158,11,0.6);
+        background: linear-gradient(145deg, rgba(245,158,11,0.28), rgba(245,158,11,0.12));
+        color: #92400e;
+        box-shadow: 0 12px 24px rgba(245,158,11,0.2), inset 0 1px 0 rgba(255,255,255,0.45);
+        font-weight: 800;
+      }
+      .cgpt-vs-chip-ghost{
+        background: transparent;
+        border-style: dashed;
+        box-shadow: none;
+        color: rgba(0,0,0,0.64);
+      }
+      .cgpt-vs-chip-ghost:hover{ background: rgba(0,0,0,0.05); }
+
+      .cgpt-vs-deg{
+        padding: 10px;
+        border-radius: 14px;
+        border: 1px solid var(--cgpt-glass-border-strong);
+        background: linear-gradient(145deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-deg.warn{
+        border-color: rgba(245,158,11,0.55);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.72),
+          0 10px 26px rgba(245,158,11,0.18);
+      }
+      .cgpt-vs-deg.bad{
+        border-color: rgba(239,68,68,0.65);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.72),
+          0 12px 28px rgba(239,68,68,0.22);
+      }
+      .cgpt-vs-deg-head{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        margin-bottom: 4px;
+      }
+      .cgpt-vs-deg-title{
+        font-weight: 800;
+        font-size: 12px;
+        letter-spacing: 0.2px;
+        color: rgba(0,0,0,0.74);
+      }
+      .cgpt-vs-deg-grid{
+        display:flex;
+        flex-direction:column;
+        gap: 0;
+      }
+      .cgpt-vs-deg-value{
+        display:flex;
+        align-items:center;
+        gap:6px;
+        flex-wrap: wrap;
+        justify-content:flex-end;
+        min-width: 0;
+      }
+      .cgpt-vs-deg-text{
+        max-width: 200px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        color: rgba(0,0,0,0.82);
+      }
+      .cgpt-vs-deg-tag{
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        display:inline-flex;
+        align-items:center;
+        font-weight: 800;
+        font-size: 11px;
+        color: rgba(0,0,0,0.76);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-deg-badge{
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(16,185,129,0.35);
+        background: linear-gradient(145deg, rgba(16,185,129,0.28), rgba(16,185,129,0.12));
+        color: #047857;
+        font-weight: 800;
+        font-size: 11px;
+        display:inline-flex;
+        align-items:center;
+        text-transform: lowercase;
+      }
+      .cgpt-vs-deg-bar{
+        margin-top: 6px;
+        height: 6px;
+        border-radius: 999px;
+        border: 1px solid var(--cgpt-glass-border);
+        background: linear-gradient(135deg, rgba(255,255,255,0.4), rgba(255,255,255,0.12));
+        overflow:hidden;
+        position: relative;
+        box-sizing: border-box;
+        box-shadow: var(--cgpt-glass-inset);
+      }
+      .cgpt-vs-deg-barInner{
+        position:absolute;
+        inset:0 auto 0 0;
+        width: 8%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #22c55e, #10b981);
+        transition: width 220ms ease, background 220ms ease;
+      }
+
+      /* Scoped tooltips */
+      #${ROOT_ID} [data-tooltip]{ position: relative; }
+      #${ROOT_ID} [data-tooltip]::after{
+        content: attr(data-tooltip);
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 6px);
+        transform: translateX(-50%) translateY(4px);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 140ms ease, transform 140ms ease;
+        white-space: pre-line;
+        min-width: 220px;
+        max-width: 320px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(17,24,39,0.94);
+        color: #fff;
+        border: 1px solid rgba(255,255,255,0.12);
+        box-shadow: 0 18px 36px rgba(0,0,0,0.28);
+        z-index: 2147483647;
+        font-size: 11px;
+        line-height: 1.55;
+      }
+      #${ROOT_ID} [data-tooltip]:hover::after{
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+      #${BTN_ID} .cgpt-vs-miniItem[data-tooltip]::after{
+        top: calc(100% + 6px);
+        bottom: auto;
+        transform: translateX(-50%) translateY(-4px);
+      }
+      #${BTN_ID} .cgpt-vs-miniItem[data-tooltip]:hover::after{
+        transform: translateX(-50%) translateY(0);
+      }
+
+      .cgpt-vs-row{
+        display:flex;
+        justify-content:space-between;
+        gap: 12px;
+        padding: 4px 0;
+      }
+      .cgpt-vs-k{ color: rgba(0,0,0,0.56); }
+      .cgpt-vs-v{ font-variant-numeric: tabular-nums; }
+
+      .mem-ok{ color:#16a34a; font-weight: 600; }
+      .mem-warn{ color:#d97706; font-weight: 600; }
+      .mem-bad{ color:#dc2626; font-weight: 700; }
+
+      .cgpt-vs-hr{
+        height: 1px;
+        background: rgba(0,0,0,0.08);
+        margin: 10px 0 8px;
+      }
+      .cgpt-vs-tip{ color: rgba(0,0,0,0.74); }
+
+      .cgpt-vs-link{ color: rgba(37,99,235,0.95); text-decoration:none; font-weight: 600; font-size: 12px; }
+      .cgpt-vs-link:hover{ text-decoration: underline; }
+
+      /* ✅ Feature Pack 工具条：紧凑+对齐+不乱 */
+      #${FP_ID}{
+        margin-top: 8px;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        flex-wrap: wrap;
+        width: 100%;
+      }
+      #${FP_ID} .fp-token{
+        font-size: 12px;
+        color: rgba(0,0,0,0.66);
+        padding: 0 2px;
+      }
+
+      #${HELP_ID}{
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.30);
+        display:none;
+        align-items:center;
+        justify-content:center;
+        z-index: 2147483647;
+      }
+      #${HELP_ID}.show{ display:flex; }
+      .cgpt-vs-helpCard{
+        width: min(720px, calc(100vw - 20px));
+        max-height: min(78vh, 680px);
+        overflow:auto;
+        padding: 16px 16px;
+        border-radius: 18px;
+        border: 1px solid var(--cgpt-glass-border-strong, rgba(255,255,255,0.75));
+        background: linear-gradient(135deg, var(--cgpt-glass-panel, rgba(255,255,255,0.88)), var(--cgpt-glass-panel-2, rgba(255,255,255,0.55)));
+        backdrop-filter: blur(18px) saturate(1.2);
+        -webkit-backdrop-filter: blur(18px) saturate(1.2);
+        box-shadow: 0 22px 60px rgba(15,23,42,0.2), inset 0 1px 0 rgba(255,255,255,0.75);
+        color: rgba(0,0,0,0.86);
+        line-height: 1.55;
+      }
+      .cgpt-vs-helpTitle{ font-size: 14px; font-weight: 800; margin-bottom: 8px; }
+      .cgpt-vs-helpClose{
+        position: sticky;
+        top: 0;
+        float: right;
+        height: 30px;
+        padding: 0 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(0,0,0,0.14);
+        background: rgba(255,255,255,0.94);
+        cursor:pointer;
+      }
+
+      /* ✅ 主题适配：暗色模式玻璃态 */
+      #${ROOT_ID}.theme-dark{
+        color: rgba(255,255,255,0.92);
+        --cgpt-glass-panel: rgba(15,23,42,0.84);
+        --cgpt-glass-panel-2: rgba(8,12,26,0.68);
+        --cgpt-glass-card: rgba(30,41,59,0.8);
+        --cgpt-glass-card-2: rgba(15,23,42,0.62);
+        --cgpt-glass-chip: rgba(30,41,59,0.72);
+        --cgpt-glass-chip-2: rgba(15,23,42,0.56);
+        --cgpt-glass-border: rgba(255,255,255,0.12);
+        --cgpt-glass-border-strong: rgba(255,255,255,0.22);
+        --cgpt-glass-highlight: rgba(255,255,255,0.18);
+        --cgpt-glass-highlight-strong: rgba(255,255,255,0.32);
+        --cgpt-glass-shadow: 0 22px 60px rgba(0,0,0,0.62);
+        --cgpt-glass-shadow-soft: 0 14px 30px rgba(0,0,0,0.42);
+        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID}{
+        border-color: var(--cgpt-glass-border);
+        background: var(--cgpt-glass-chip);
+        color: rgba(255,255,255,0.9);
+        box-shadow: var(--cgpt-glass-shadow);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-miniItem{
+        border-color: rgba(255,255,255,0.22);
+        background: linear-gradient(150deg, rgba(30,41,59,0.92), rgba(15,23,42,0.78));
+        color: rgba(255,255,255,0.92);
+        backdrop-filter: blur(18px) saturate(1.2);
+        -webkit-backdrop-filter: blur(18px) saturate(1.2);
+        box-shadow:
+          0 10px 22px rgba(0,0,0,0.45),
+          inset 0 1px 0 rgba(255,255,255,0.08),
+          inset 0 -1px 0 rgba(0,0,0,0.4);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-miniItem::before{
+        background:
+          radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.2), rgba(255,255,255,0.04) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.0));
+        opacity: 0.55;
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-statusPill.ok{
+        border-color: rgba(52,211,153,0.62);
+        background: linear-gradient(140deg, rgba(16,185,129,0.35), rgba(16,185,129,0.16));
+        color: #d1fae5;
+        box-shadow:
+          0 12px 24px rgba(16,185,129,0.22),
+          inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-statusPill.warn{
+        border-color: rgba(251,191,36,0.72);
+        background: linear-gradient(140deg, rgba(251,191,36,0.32), rgba(251,191,36,0.14));
+        color: #fde68a;
+        box-shadow:
+          0 12px 24px rgba(251,191,36,0.22),
+          inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-statusPill.bad{
+        border-color: rgba(248,113,113,0.72);
+        background: linear-gradient(140deg, rgba(248,113,113,0.28), rgba(248,113,113,0.12));
+        color: #fecaca;
+        box-shadow:
+          0 12px 24px rgba(248,113,113,0.22),
+          inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-statusPill.off{
+        border-color: rgba(148,163,184,0.55);
+        background: linear-gradient(140deg, rgba(148,163,184,0.24), rgba(148,163,184,0.12));
+        color: #e2e8f0;
+        box-shadow:
+          0 12px 24px rgba(148,163,184,0.18),
+          inset 0 1px 0 rgba(255,255,255,0.06);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID} .cgpt-vs-miniItem.pause{
+        border-color: rgba(251,191,36,0.72);
+        background: linear-gradient(140deg, rgba(251,191,36,0.32), rgba(251,191,36,0.14));
+        color: #fde68a;
+        box-shadow:
+          0 12px 24px rgba(251,191,36,0.22),
+          inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark #${BTN_ID}:hover{ background: rgba(30,41,59,0.92); }
+      #${ROOT_ID}.theme-dark #${PANEL_ID}{
+        border-color: var(--cgpt-glass-border-strong);
+        background: linear-gradient(135deg, var(--cgpt-glass-panel), var(--cgpt-glass-panel-2));
+        color: rgba(255,255,255,0.92);
+        box-shadow: var(--cgpt-glass-shadow), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-org{
+        border-color: var(--cgpt-glass-border-strong);
+        background: linear-gradient(150deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-sectionTitle,
+      #${ROOT_ID}.theme-dark .cgpt-vs-groupTitle{ color: rgba(255,255,255,0.76); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-statusText{ color: rgba(255,255,255,0.94); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-statusReason{ color: rgba(255,255,255,0.7); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-topTag{
+        border-color: var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        color: rgba(255,255,255,0.92);
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-topTag.pause{
+        border-color: rgba(251,191,36,0.72);
+        background: linear-gradient(145deg, rgba(251,191,36,0.32), rgba(251,191,36,0.16));
+        color: #fde68a;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-k{ color: rgba(255,255,255,0.64); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tip{ color: rgba(255,255,255,0.82); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-hr{ background: rgba(255,255,255,0.12); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-seg{
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        border-color: var(--cgpt-glass-border-strong);
+        box-shadow: var(--cgpt-glass-inset), var(--cgpt-glass-shadow-soft);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-seg button{ color: rgba(255,255,255,0.74); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-seg button.active{
+        background: linear-gradient(150deg, rgba(255,255,255,0.2), rgba(255,255,255,0.06));
+        color: rgba(255,255,255,0.96);
+        box-shadow: 0 12px 26px rgba(0,0,0,0.46), inset 0 1px 0 rgba(255,255,255,0.12);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip{
+        border-color: var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        color: rgba(255,255,255,0.9);
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip:hover{ background: linear-gradient(145deg, rgba(51,65,85,0.9), rgba(15,23,42,0.7)); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip.primary{ border-color: var(--cgpt-glass-border-strong); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip.danger{
+        border-color: rgba(248,113,113,0.6);
+        background: linear-gradient(145deg, rgba(248,113,113,0.3), rgba(248,113,113,0.14));
+        color: #fecaca;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip.active{
+        border-color: rgba(52,211,153,0.6);
+        background: linear-gradient(145deg, rgba(16,185,129,0.3), rgba(16,185,129,0.16));
+        color: #d1fae5;
+        box-shadow: 0 14px 28px rgba(16,185,129,0.3), inset 0 1px 0 rgba(255,255,255,0.12);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip.paused{
+        border-color: rgba(251,191,36,0.72);
+        background: linear-gradient(145deg, rgba(251,191,36,0.34), rgba(251,191,36,0.18));
+        color: #fde68a;
+        box-shadow: 0 14px 28px rgba(251,191,36,0.28), inset 0 1px 0 rgba(255,255,255,0.12);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip-ghost{
+        background: rgba(255,255,255,0.04);
+        border-color: rgba(255,255,255,0.2);
+        color: rgba(255,255,255,0.82);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-chip-ghost:hover{ background: rgba(255,255,255,0.08); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg{
+        border-color: var(--cgpt-glass-border-strong);
+        background: linear-gradient(145deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg.warn{
+        border-color: rgba(251,191,36,0.62);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.06),
+          0 16px 30px rgba(251,191,36,0.22);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg.bad{
+        border-color: rgba(248,113,113,0.72);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.06),
+          0 18px 34px rgba(248,113,113,0.26);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-title{ color: rgba(255,255,255,0.9); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-text{ color: rgba(255,255,255,0.9); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-tag{
+        border-color: var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        color: rgba(255,255,255,0.92);
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-badge{
+        border-color: rgba(52,211,153,0.6);
+        background: linear-gradient(145deg, rgba(16,185,129,0.34), rgba(16,185,129,0.18));
+        color: #d1fae5;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-bar{
+        border-color: rgba(255,255,255,0.14);
+        background: linear-gradient(135deg, rgba(255,255,255,0.24), rgba(255,255,255,0.08));
+        box-shadow: var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-barInner{
+        background: linear-gradient(90deg, #34d399, #22d3ee);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-link{ color: rgba(147,197,253,0.98); }
+      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token{
+        color: rgba(255,255,255,0.7);
+      }
+      #${ROOT_ID}.theme-dark .mem-ok{ color:#4ade80; }
+      #${ROOT_ID}.theme-dark .mem-warn{ color:#fbbf24; }
+      #${ROOT_ID}.theme-dark .mem-bad{ color:#f87171; }
+
+      #${HELP_ID}.theme-dark{ background: rgba(0,0,0,0.56); }
+      #${HELP_ID}.theme-dark .cgpt-vs-helpCard{
+        border-color: rgba(255,255,255,0.18);
+        background: linear-gradient(135deg, rgba(15,23,42,0.92), rgba(8,12,24,0.78));
+        color: rgba(255,255,255,0.92);
+        box-shadow: 0 24px 70px rgba(0,0,0,0.62), inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${HELP_ID}.theme-dark .cgpt-vs-helpClose{
+        border-color: rgba(255,255,255,0.18);
+        background: rgba(30,41,59,0.9);
+        color: rgba(255,255,255,0.94);
+      }
+
+      #${ROOT_ID}.booting #${DOT_ID},
+      #${ROOT_ID}.booting .cgpt-vs-miniDot{
+        background: #9ca3af;
+        box-shadow: 0 0 0 2px rgba(156,163,175,0.18);
+      }
+      #${ROOT_ID}.booting #${STATUS_PILL_ID}{
+        border-color: rgba(107,114,128,0.45);
+        background: rgba(107,114,128,0.18);
+        color: rgba(55,65,81,0.85);
+        box-shadow: 0 10px 22px rgba(107,114,128,0.12);
+      }
+      #${ROOT_ID}.booting .cgpt-vs-statusText{
+        color: rgba(55,65,81,0.7);
+      }
+      #${ROOT_ID}.booting .cgpt-vs-deg-tag,
+      #${ROOT_ID}.booting .cgpt-vs-topTag{
+        color: rgba(107,114,128,0.85);
+        border-color: rgba(0,0,0,0.1);
+        background: rgba(255,255,255,0.82);
+        box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+      }
+      #${ROOT_ID}.booting .cgpt-vs-deg-text{
+        color: rgba(107,114,128,0.8);
+      }
+      #${ROOT_ID}.theme-dark.booting #${STATUS_PILL_ID}{
+        border-color: rgba(148,163,184,0.45);
+        background: rgba(148,163,184,0.18);
+        color: rgba(226,232,240,0.92);
+        box-shadow: 0 10px 22px rgba(0,0,0,0.38);
+      }
+      #${ROOT_ID}.theme-dark.booting .cgpt-vs-deg-tag,
+      #${ROOT_ID}.theme-dark.booting .cgpt-vs-topTag{
+        color: rgba(226,232,240,0.9);
+        border-color: rgba(255,255,255,0.18);
+        background: rgba(51,65,85,0.76);
+        box-shadow: 0 8px 18px rgba(0,0,0,0.38);
+      }
+      #${ROOT_ID}.theme-dark.booting .cgpt-vs-deg-text{
+        color: rgba(226,232,240,0.75);
+      }
+
+      #${ROOT_ID}.pinned #${BTN_ID}{ cursor: grab; }
+      #${ROOT_ID}.pinned.dragging #${BTN_ID}{
+        cursor: grabbing;
+        box-shadow: 0 18px 44px rgba(0,0,0,0.24);
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  // ========================== UI：构建 Root ==========================
+  function ensureRoot() {
+    injectStyles();
+
+    let root = document.getElementById(ROOT_ID);
+    if (root) return root;
+
+    root = document.createElement('div');
+    root.id = ROOT_ID;
+    root.classList.add('booting');
+    logEvent('info', 'ui.createRoot');
+
+    root.innerHTML = `
+      <div id="${BTN_ID}" class="cgpt-vs-atom cgpt-vs-btn" role="button" tabindex="0" aria-label="ChatGPT Virtual Scroll Engine">
+        <span id="${STATUS_PILL_ID}" class="cgpt-vs-miniItem cgpt-vs-atom cgpt-vs-statusPill">
+          <span id="${DOT_ID}" class="cgpt-vs-miniDot"></span>
+          <span id="${STATUS_TEXT_ID}" class="cgpt-vs-miniText">${t('health')}</span>
+        </span>
+        <span id="${TOP_TAGS_ID}" class="cgpt-vs-miniTags cgpt-vs-molecule">
+          <span class="cgpt-vs-miniItem cgpt-vs-atom" id="${TOP_SVC_TAG_ID}" data-tooltip="${t('monitorServiceTip')}">
+            <span class="cgpt-vs-miniDot"></span>
+            <span class="cgpt-vs-miniText">Service</span>
+          </span>
+          <span class="cgpt-vs-miniItem cgpt-vs-atom" id="${TOP_IP_TAG_ID}" data-tooltip="${t('monitorIpTip')}">
+            <span class="cgpt-vs-miniDot"></span>
+            <span class="cgpt-vs-miniText">IP</span>
+          </span>
+          <span class="cgpt-vs-miniItem cgpt-vs-atom" id="${TOP_POW_TAG_ID}" data-tooltip="${t('monitorPowTip')}">
+            <span class="cgpt-vs-miniDot"></span>
+            <span class="cgpt-vs-miniText">PoW</span>
+          </span>
+          <span class="cgpt-vs-miniItem cgpt-vs-atom" id="${TOP_OPT_TAG_ID}">
+            <span class="cgpt-vs-miniDot"></span>
+            <span class="cgpt-vs-miniText">Idle</span>
+          </span>
+          <span class="cgpt-vs-miniItem cgpt-vs-atom pause" id="${TOP_PAUSE_TAG_ID}" style="display:none;">
+            <span class="cgpt-vs-miniDot"></span>
+            <span class="cgpt-vs-miniText">Paused</span>
+          </span>
+        </span>
+      </div>
+
+      <div id="${PANEL_ID}" class="cgpt-vs-template">
+        <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-status" data-org="status">
+          <div class="cgpt-vs-sectionTitle">
+            <span>${t('sectionStatus')}</span>
+          </div>
+          <div class="cgpt-vs-statusBar cgpt-vs-molecule">
+            <div class="cgpt-vs-statusMain">
+              <div class="cgpt-vs-statusText" data-k="statusMain">--</div>
+              <div class="cgpt-vs-statusReason" id="${STATUS_REASON_ID}">--</div>
+            </div>
+          </div>
+          <div class="cgpt-vs-toprow" style="margin-top:8px;">
+            <div style="flex:1">
+              <div class="cgpt-vs-seg cgpt-vs-molecule" aria-label="virtualization mode">
+                <button class="cgpt-vs-atom" type="button" data-mode="performance">${lang === 'zh' ? '性能' : 'Performance'}</button>
+                <button class="cgpt-vs-atom" type="button" data-mode="balanced">${lang === 'zh' ? '平衡' : 'Balanced'}</button>
+                <button class="cgpt-vs-atom" type="button" data-mode="conservative">${lang === 'zh' ? '保守' : 'Conservative'}</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div class="cgpt-vs-layout cgpt-vs-template-body">
+          <div class="cgpt-vs-col-left cgpt-vs-template-slot" data-template="left">
+            <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-actions" data-org="actions">
+              <div class="cgpt-vs-sectionTitle">
+                <span>${t('sectionRuntime')}</span>
+              </div>
+
+              <div class="cgpt-vs-actionsGrid cgpt-vs-molecule">
+                <div class="cgpt-vs-mol-group">
+                  <div class="cgpt-vs-groupTitle">${lang === 'zh' ? '核心操作' : 'Primary Actions'}</div>
+                  <div class="cgpt-vs-controls cgpt-vs-ops">
+                    <div class="cgpt-vs-chiprow cgpt-vs-molecule">
+                      <button class="cgpt-vs-chip cgpt-vs-atom primary" id="cgpt-vs-toggle">--</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="${OPTIMIZE_BTN_ID}" title="${t('optimizeSoftTip')}">${t('optimizeSoft')}</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="${SCROLL_LATEST_BTN_ID}" title="${t('scrollLatestTip')}">${t('scrollLatest')}</button>
+                    </div>
+                    <div class="cgpt-vs-chiprow cgpt-vs-molecule">
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-newChat">${t('newChat')}</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="cgpt-vs-mol-group">
+                  <div class="cgpt-vs-groupTitle">${lang === 'zh' ? '策略与显示' : 'Strategy & View'}</div>
+                  <div class="cgpt-vs-controls cgpt-vs-flags">
+                    <div class="cgpt-vs-chiprow cgpt-vs-molecule">
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="${AUTO_PAUSE_BTN_ID}" title="${t('autoPauseTip')}">--</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-pin">📌</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-helpBtn">?</button>
+                      <span class="cgpt-vs-chippair">
+                        <button class="cgpt-vs-chip cgpt-vs-atom" id="${LOG_EXPORT_BTN_ID}" title="${t('logExportTip')}">${t('logExport')}</button>
+                        <button class="cgpt-vs-chip cgpt-vs-atom" id="${DEG_REFRESH_BTN_ID}" title="${t('monitorRefreshTip')}">${t('monitorRefresh')}</button>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="cgpt-vs-mol-group">
+                  <div class="cgpt-vs-groupTitle">Feature Pack</div>
+                  <div id="${FP_ID}"></div>
+                </div>
+              </div>
+            </section>
+            <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-mood" id="${MOOD_SECTION_ID}">
+              <div class="cgpt-vs-sectionTitle">
+                <span>${t('moodTitle')}</span>
+              </div>
+              <div class="cgpt-vs-moodText" id="${MOOD_TEXT_ID}">--</div>
+              <div class="cgpt-vs-moodSub" id="${MOOD_SUB_ID}">--</div>
+            </section>
+          </div>
+
+          <div class="cgpt-vs-col-right cgpt-vs-template-slot" data-template="right">
+            <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-stats" data-org="stats">
+              <div class="cgpt-vs-sectionTitle">
+                <span>${t('sectionStats')}</span>
+              </div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '当前模式' : 'Mode'}</span><span class="cgpt-vs-v" data-k="mode">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">DOM</span><span class="cgpt-vs-v" data-k="dom">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '内存（JS 堆）' : 'Memory (JS Heap)'}</span><span class="cgpt-vs-v" data-k="mem">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '虚拟化' : 'Virtualization'}</span><span class="cgpt-vs-v" data-k="virt">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '已对话轮数' : 'Turns'}</span><span class="cgpt-vs-v" data-k="turns">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '推荐可聊剩余' : 'Estimated remaining'}</span><span class="cgpt-vs-v" data-k="remain">--</span></div>
+            </section>
+
+            <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-monitor cgpt-vs-deg" id="${DEG_SECTION_ID}" data-org="monitor">
+              <div class="cgpt-vs-sectionTitle">
+                <span>${t('sectionMonitor')}</span>
+              </div>
+              <div class="cgpt-vs-deg-grid cgpt-vs-molecule">
+                <div class="cgpt-vs-row">
+                  <span class="cgpt-vs-k">${t('monitorService')}</span>
+                  <div class="cgpt-vs-deg-value">
+                    <span class="cgpt-vs-deg-text" id="${DEG_SERVICE_DESC_ID}" data-tooltip="${t('monitorServiceTip')}">--</span>
+                    <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_SERVICE_TAG_ID}">--</span>
+                  </div>
+                </div>
+                <div class="cgpt-vs-row">
+                  <span class="cgpt-vs-k">${t('monitorIp')}</span>
+                  <div class="cgpt-vs-deg-value">
+                    <span class="cgpt-vs-deg-text monospace" id="${DEG_IP_VALUE_ID}" data-tooltip="${t('monitorIpTip')}">--</span>
+                    <span class="cgpt-vs-deg-badge cgpt-vs-atom" id="${DEG_IP_BADGE_ID}" style="display:none;">warp</span>
+                    <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_IP_TAG_ID}">--</span>
+                  </div>
+                </div>
+                <div class="cgpt-vs-row">
+                  <span class="cgpt-vs-k">${t('monitorPow')}</span>
+                  <div class="cgpt-vs-deg-value">
+                    <span class="cgpt-vs-deg-text monospace" id="${DEG_POW_VALUE_ID}" data-tooltip="${t('monitorPowTip')}">--</span>
+                    <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_POW_TAG_ID}">--</span>
+                  </div>
+                </div>
+                <div class="cgpt-vs-deg-bar" data-tooltip="${t('monitorPowTip')}">
+                  <div class="cgpt-vs-deg-barInner" id="${DEG_POW_BAR_ID}"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div class="cgpt-vs-hr"></div>
+        <div class="cgpt-vs-tip" data-k="tip">--</div>
+      </div>
+    `;
+
+    const help = document.createElement('div');
+    help.id = HELP_ID;
+    help.innerHTML = `
+      <div class="cgpt-vs-helpCard" role="dialog" aria-label="Help">
+        <button class="cgpt-vs-helpClose" id="cgpt-vs-helpClose">${lang === 'zh' ? '关闭' : 'Close'}</button>
+        <div class="cgpt-vs-helpTitle">${lang === 'zh' ? '长对话加速仪表盘（小白版说明）' : 'Long Chat Accelerator (Quick Guide)'}</div>
+
+        <div style="margin:8px 0 10px;">
+          <b>${lang === 'zh' ? '绿/黄/红小圆点是什么？' : 'What is the green/yellow/red dot?'}</b><br/>
+          ${lang === 'zh'
+            ? '它是网页健康度指示灯：绿色=状态好；黄色=负载偏高；红色=接近卡顿区。'
+            : 'It indicates page health: green=good, yellow=high load, red=near lag.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '三段模式怎么选？' : 'How to choose modes?'}</b><br/>
+          ${lang === 'zh'
+            ? '性能=最省资源；平衡=日常推荐；保守=保留更多历史但更吃资源。'
+            : 'Performance=lowest resource; Balanced=recommended; Conservative=keeps more history but uses more resources.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '暂停/启用有什么区别？' : 'Pause vs Enable?'}</b><br/>
+          ${lang === 'zh'
+            ? '启用会把屏幕外历史折叠成占位以减负；暂停会完整显示但更容易卡。'
+            : 'Enable folds off-screen history to reduce load; Pause shows full history but may lag.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '“优化”会丢内容吗？' : 'Does “Optimize” delete content?'}</b><br/>
+          ${lang === 'zh'
+            ? '不会。点击“优化”会根据负载自动选择软/硬与屏数；远距历史可能被占位，靠近会自动恢复。'
+            : 'No. Optimize auto picks soft/hard and screen ranges by load; far history may become placeholders and restores as you scroll near.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? 'Ctrl+F 搜索为什么会变慢？' : 'Why Find (Ctrl+F) can be slower?'}</b><br/>
+          ${lang === 'zh'
+            ? '为了让你能搜到所有历史，脚本会临时恢复完整内容；按 Esc 退出后自动恢复。'
+            : 'To let you search all history, the script temporarily restores full content; press Esc to resume acceleration.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '隐私与声明' : 'Privacy'}</b><br/>
+          ${lang === 'zh'
+            ? '本脚本不上传任何对话内容，所有逻辑均在浏览器本地运行。'
+            : 'This script does not upload your chat. Everything runs locally in your browser.'}
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(root);
+    document.body.appendChild(help);
+
+    applyThemeClass();
+
+    root.classList.toggle('open', RESTORE_LAST_OPEN && !!wasOpen);
+
+    bindUI(root, help);
+    applyPinnedState();
+    updateMoodUI(true);
+    refreshMoodFromApi();
+
+    return root;
+  }
+
+  // ========================== Feature Pack 渲染 ==========================
+  function renderFeaturePack(forceRebuild) {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+
+    const slot = root.querySelector('#' + FP_ID);
+    if (!slot) return;
+
+    if (!forceRebuild && slot.childElementCount) return;
+
+    tokenState.instance += 1;
+    const instance = tokenState.instance;
+    tokenState.pending = false;
+    if (tokenState.timer) {
+      clearTimeout(tokenState.timer);
+      tokenState.timer = 0;
+    }
+
+    slot.innerHTML = '';
+
+    const token = document.createElement('span');
+    token.className = 'fp-token';
+    slot.append(token);
+
+    // token 更新
+    token.textContent = `${t('token')}: ${tokenState.value || 0}`;
+    const tick = () => {
+      if (instance !== tokenState.instance) return;
+      if (!document.body.contains(token)) return;
+      const rootEl = document.getElementById(ROOT_ID);
+      const open = !!rootEl && rootEl.classList.contains('open');
+      const now = Date.now();
+
+      if (open && now >= tokenState.nextAt && !tokenState.pending) {
+        const busy = autoPauseOnChat && updateChatBusy(false);
+        if (busy) {
+          tokenState.nextAt = Date.now() + TOKEN_UPDATE_MIN_MS;
+          return;
+        }
+        tokenState.pending = true;
+        const run = () => {
+          if (instance !== tokenState.instance) return;
+          if (!document.body.contains(token)) {
+            tokenState.pending = false;
+            return;
+          }
+          const value = estimateTokens();
+          tokenState.value = value;
+          token.textContent = `${t('token')}: ${value}`;
+          tokenState.pending = false;
+          tokenState.nextAt = Date.now() + TOKEN_UPDATE_MIN_MS;
+        };
+        if (typeof requestIdleCallback === 'function') {
+          requestIdleCallback(() => run(), { timeout: 1200 });
+        }
+        else {
+          setTimeout(run, 0);
+        }
+      }
+
+      const delay = open ? TOKEN_UPDATE_MIN_MS : TOKEN_UPDATE_MAX_MS;
+      tokenState.timer = setTimeout(tick, delay);
+    };
+    tokenState.nextAt = 0;
+    tick();
+  }
+
+  // ========================== UI：事件绑定 ==========================
+  function bindUI(root, help) {
+    const btn = root.querySelector('#' + BTN_ID);
+    const panel = root.querySelector('#' + PANEL_ID);
+
+    const toggleBtn = root.querySelector('#cgpt-vs-toggle');
+    const pinBtn = root.querySelector('#cgpt-vs-pin');
+    const helpBtn = root.querySelector('#cgpt-vs-helpBtn');
+    const helpClose = help.querySelector('#cgpt-vs-helpClose');
+
+    const optimizeBtn = root.querySelector('#' + OPTIMIZE_BTN_ID);
+    const newChatBtn = root.querySelector('#cgpt-vs-newChat');
+    const autoPauseBtn = root.querySelector('#' + AUTO_PAUSE_BTN_ID);
+    const scrollLatestBtn = root.querySelector('#' + SCROLL_LATEST_BTN_ID);
+    const logExportBtn = root.querySelector('#' + LOG_EXPORT_BTN_ID);
+
+    function setOpen(open) {
+      root.classList.toggle('open', open);
+      saveBool(KEY_LAST_OPEN, open);
+      // Keep the top bar fixed while the panel is open to avoid vertical jitter.
+      if (pinned || open) stopFollowPositionLoop();
+      else startFollowPositionLoop();
+      if (open) requestAnimationFrame(() => placeMoodSection());
+    }
+
+    btn.addEventListener('click', () => {
+      if (root.classList.contains('dragging')) return;
+      setOpen(!root.classList.contains('open'));
+    });
+
+    btn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setOpen(!root.classList.contains('open'));
+      }
+    });
+
+    if (docClickHandler) {
+      document.removeEventListener('click', docClickHandler, true);
+    }
+    docClickHandler = (e) => {
+      const currentRoot = document.getElementById(ROOT_ID);
+      if (!currentRoot || !currentRoot.classList.contains('open')) return;
+      if (currentRoot.contains(e.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener('click', docClickHandler, true);
+
+    panel.querySelectorAll('.cgpt-vs-seg button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const mode = b.getAttribute('data-mode');
+        if (mode !== 'performance' && mode !== 'balanced' && mode !== 'conservative') return;
+        saveMode(mode);
+        clearAutoHard('mode', getDomNodeCount());
+        logEvent('info', 'mode', {
+          mode
+        });
+        refreshSegUI(root);
+        scheduleVirtualize();
+        updateUI();
+      });
+    });
+
+    toggleBtn.addEventListener('click', () => {
+      virtualizationEnabled = !virtualizationEnabled;
+      saveBool(KEY_ENABLED, virtualizationEnabled);
+      clearAutoHard('toggle', getDomNodeCount());
+
+      if (!virtualizationEnabled) unvirtualizeAll();
+      else scheduleVirtualize();
+
+      updateUI();
+      logEvent('info', 'virtualization.toggle', {
+        enabled: virtualizationEnabled
+      });
+    });
+
+    helpBtn.addEventListener('click', () => help.classList.add('show'));
+    helpClose.addEventListener('click', () => help.classList.remove('show'));
+    help.addEventListener('click', (e) => {
+      if (e.target === help) help.classList.remove('show');
+    });
+
+    pinBtn.addEventListener('click', () => {
+      pinned = !pinned;
+      saveBool(KEY_PINNED, pinned);
+      applyPinnedState();
+      updateUI();
+      logEvent('info', 'pin.toggle', {
+        pinned
+      });
+    });
+
+    if (autoPauseBtn) {
+      autoPauseBtn.addEventListener('click', () => {
+        setChatPause(!autoPauseOnChat);
+      });
+    }
+
+    if (logExportBtn) {
+      logExportBtn.addEventListener('click', () => {
+        const prev = logExportBtn.textContent;
+        exportLogsToFile('ui');
+        logExportBtn.textContent = t('logExported');
+        setTimeout(() => {
+          logExportBtn.textContent = prev;
+        }, 1200);
+      });
+    }
+
+
+    if (scrollLatestBtn) {
+      scrollLatestBtn.addEventListener('click', () => {
+        scrollToLatest();
+        flashDot();
+        logEvent('info', 'scroll.latest');
+      });
+    }
+
+    if (optimizeBtn) {
+      optimizeBtn.addEventListener('click', () => {
+        runAutoOptimize('ui');
+      });
+    }
+
+    newChatBtn.addEventListener('click', () => {
+      const ok = tryClickNewChat();
+      logEvent('info', 'newChat', {
+        success: ok
+      });
+      if (!ok) PAGE_WIN.open(location.origin + '/', '_blank', 'noopener,noreferrer');
+    });
+
+    installDrag(root);
+    refreshSegUI(root);
+
+    // ✅ Feature Pack 一体化渲染
+    renderFeaturePack(true);
+  }
+
+  function refreshSegUI(root) {
+    const panel = root.querySelector('#' + PANEL_ID);
+    if (!panel) return;
+    panel.querySelectorAll('.cgpt-vs-seg button').forEach((b) => {
+      b.classList.toggle('active', b.getAttribute('data-mode') === currentMode);
+    });
+  }
+
+  function applyPinnedState() {
+    const root = ensureRoot();
+    root.classList.toggle('pinned', pinned);
+
+    if (pinned) {
+      stopFollowPositionLoop();
+      root.style.left = `${clamp(pinnedPos.x, 0, window.innerWidth - 60)}px`;
+      root.style.top = `${clamp(pinnedPos.y, 0, window.innerHeight - 60)}px`;
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+    }
+    else {
+      startFollowPositionLoop();
+      positionNearModelButton();
+    }
+  }
+
+  function installDrag(root) {
+    let dragging = false;
+    let startX = 0,
+      startY = 0;
+    let originX = 0,
+      originY = 0;
+
+    const btn = root.querySelector('#' + BTN_ID);
+    if (!btn) return;
+
+    btn.addEventListener('pointerdown', (e) => {
+      if (!pinned) return;
+      if (e.button !== 0) return;
+
+      dragging = true;
+      root.classList.add('dragging');
+      btn.setPointerCapture(e.pointerId);
+
+      startX = e.clientX;
+      startY = e.clientY;
+
+      const rect = root.getBoundingClientRect();
+      originX = rect.left;
+      originY = rect.top;
+
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    btn.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+
+      const nx = clamp(originX + dx, 0, window.innerWidth - 40);
+      const ny = clamp(originY + dy, 0, window.innerHeight - 40);
+
+      pinnedPos.x = nx;
+      pinnedPos.y = ny;
+      savePos();
+
+      root.style.left = `${nx}px`;
+      root.style.top = `${ny}px`;
+    });
+
+    btn.addEventListener('pointerup', (e) => {
+      if (!dragging) return;
+      dragging = false;
+      root.classList.remove('dragging');
+
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    btn.addEventListener('pointercancel', () => {
+      dragging = false;
+      root.classList.remove('dragging');
+    });
+  }
+
+  function flashDot() {
+    const dot = document.getElementById(DOT_ID);
+    if (!dot) return;
+    dot.style.transform = 'scale(1.14)';
+    setTimeout(() => {
+      dot.style.transform = 'scale(1)';
+    }, 140);
+  }
+
+  function scrollToLatest() {
+    const info = getScrollMetrics();
+    const smoothScroll = (target, top) => {
+      try {
+        target.scrollTo({ top, behavior: 'smooth' });
+      }
+      catch {
+        target.scrollTo(0, top);
+      }
+    };
+
+    if (info.isWindow) {
+      const doc = document.scrollingElement || document.documentElement || document.body;
+      const top = Math.max(0, (doc.scrollHeight || 0) - window.innerHeight);
+      smoothScroll(window, top);
+    }
+    else if (info.root) {
+      const rootEl = info.root;
+      const top = Math.max(0, (rootEl.scrollHeight || 0) - (rootEl.clientHeight || 0));
+      smoothScroll(rootEl, top);
+    }
+
+    setTimeout(() => scheduleVirtualize(), 160);
+  }
+
+  function tryClickNewChat() {
+    const candidates = document.querySelectorAll('a, button, [role="button"]');
+    for (const el of candidates) {
+      const tx = ((el.innerText || el.textContent || '')).trim();
+      if (!tx) continue;
+      if (tx === '新聊天' || tx === 'New chat' || tx.includes('新对话') || tx.includes('New chat')) {
+        try {
+          el.click();
+          return true;
+        }
+        catch {}
+      }
+    }
+    return false;
+  }
+
+  function updateDegradedUI(root, degraded) {
+    if (!root) return;
+
+    const toRgba = (hex, alpha) => {
+      if (!hex || typeof hex !== 'string') return '';
+      let h = hex.trim();
+      if (h.startsWith('rgb')) {
+        const m = h.match(/rgba?\(([^)]+)\)/i);
+        if (!m) return '';
+        const parts = m[1].split(',').map((v) => v.trim());
+        const r = Number.parseFloat(parts[0]);
+        const g = Number.parseFloat(parts[1]);
+        const b = Number.parseFloat(parts[2]);
+        if ([r, g, b].some((v) => Number.isNaN(v))) return '';
+        return `rgba(${r},${g},${b},${alpha})`;
+      }
+      if (!h.startsWith('#')) return '';
+      if (h.length === 4) {
+        h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
+      }
+      if (h.length !== 7) return '';
+      const r = parseInt(h.slice(1, 3), 16);
+      const g = parseInt(h.slice(3, 5), 16);
+      const b = parseInt(h.slice(5, 7), 16);
+      if ([r, g, b].some((v) => Number.isNaN(v))) return '';
+      return `rgba(${r},${g},${b},${alpha})`;
+    };
+    const paintMiniItem = (item, label, color, tooltip) => {
+      if (!item) return;
+      const dot = item.querySelector('.cgpt-vs-miniDot');
+      const textEl = item.querySelector('.cgpt-vs-miniText');
+      if (label != null && textEl) textEl.textContent = label;
+      if (tooltip) item.setAttribute('data-tooltip', tooltip);
+      if (color) {
+        item.style.color = color;
+        const border = toRgba(color, 0.55);
+        const bg = toRgba(color, 0.16);
+        const outer = toRgba(color, 0.22);
+        if (border) item.style.borderColor = border;
+        if (bg) item.style.background = bg;
+        if (outer) item.style.boxShadow = `0 0 0 1px ${border || 'rgba(0,0,0,0.1)'}, 0 6px 14px ${outer}`;
+        if (dot) {
+          dot.style.background = color;
+          const glow = toRgba(color, 0.18);
+          if (glow) dot.style.boxShadow = `0 0 0 2px ${glow}`;
+        }
+      }
+      else {
+        item.style.color = '';
+        item.style.borderColor = '';
+        item.style.background = '';
+        item.style.boxShadow = '';
+        if (dot) {
+          dot.style.background = '';
+          dot.style.boxShadow = '';
+        }
+      }
+    };
+
+    const refreshBtn = root.querySelector('#' + DEG_REFRESH_BTN_ID);
+    if (refreshBtn) {
+      refreshBtn.textContent = t('monitorRefresh');
+      refreshBtn.title = t('monitorRefreshTip');
+      if (refreshBtn.dataset.bound !== '1') {
+        refreshBtn.dataset.bound = '1';
+        refreshBtn.addEventListener('click', () => {
+          ensureFetchHook();
+          ensureXhrHook();
+          refreshServiceStatus(true);
+          refreshIPInfo(true);
+          refreshPowViaRequirements(true);
+        });
+      }
+    }
+
+    const serviceDescEl = root.querySelector('#' + DEG_SERVICE_DESC_ID);
+    const serviceTagEl = root.querySelector('#' + DEG_SERVICE_TAG_ID);
+    const serviceFresh = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS);
+    const serviceHasCache = !!(degradedState.service.description || degradedState.service.indicator);
+    const serviceInfo = (serviceFresh || serviceHasCache) ?
+      getServiceIndicatorInfo(degradedState.service.indicator, degradedState.service.description) :
+      getServiceIndicatorInfo('', '');
+    let serviceDesc = serviceFresh ? (degradedState.service.description || '--') :
+      (serviceHasCache ? (degradedState.service.description || '--') : t('monitorUnknown'));
+    let serviceTag = serviceFresh ?
+      (degradedState.service.indicator === 'none' ? 'ok' : (degradedState.service.indicator || '--')) :
+      (serviceHasCache ? (degradedState.service.indicator || '--') : '--');
+    // Use compact Chinese labels for the mini tags in the top bar.
+    if (lang === 'zh') {
+      const compact = compactServiceLabel(degradedState.service.indicator);
+      if (serviceFresh || serviceHasCache) {
+        serviceTag = compact;
+        if (degradedState.service.indicator === 'none') {
+          serviceDesc = '服务正常';
+        }
+        else if (degradedState.service.indicator === 'minor') {
+          serviceDesc = '轻微波动';
+        }
+        else if (degradedState.service.indicator === 'major') {
+          serviceDesc = '严重波动';
+        }
+        else if (degradedState.service.indicator === 'critical') {
+          serviceDesc = '官方服务可能宕机';
+        }
+        else {
+          serviceDesc = serviceFresh ? `服务${compact}` : (degradedState.service.description || `服务${compact}`);
+        }
+      }
+      else {
+        serviceDesc = t('monitorUnknown');
+        serviceTag = t('monitorUnknown');
+      }
+    }
+    const serviceTip = `${t('monitorServiceTip')}\n${t('monitorOpenStatus')}${serviceFresh ? '' : `\n${getStaleHint(degradedState.service.updatedAt)}`}`;
+    if (serviceDescEl) {
+      serviceDescEl.textContent = serviceDesc;
+      serviceDescEl.style.color = serviceFresh ? serviceInfo.color : '#9ca3af';
+      serviceDescEl.setAttribute('data-tooltip', serviceTip);
+      if (serviceDescEl.dataset.bound !== '1') {
+        serviceDescEl.dataset.bound = '1';
+        serviceDescEl.addEventListener('click', () => PAGE_WIN.open('https://status.openai.com', '_blank'));
+      }
+    }
+    if (serviceTagEl) {
+      serviceTagEl.textContent = serviceTag;
+      serviceTagEl.style.color = serviceFresh ? serviceInfo.color : '#9ca3af';
+      serviceTagEl.setAttribute('data-tooltip', serviceTip);
+    }
+
+    const ipEl = root.querySelector('#' + DEG_IP_VALUE_ID);
+    const ipTagEl = root.querySelector('#' + DEG_IP_TAG_ID);
+    const ipBadgeEl = root.querySelector('#' + DEG_IP_BADGE_ID);
+    const ipQualityFresh = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS);
+    const ipHasCache = !!(degradedState.ip.qualityLabel || degradedState.ip.qualityScore != null);
+    const ipColor = ipQualityFresh ? degradedState.ip.qualityColor : '#9ca3af';
+    const ipInfo = getIpRiskInfo(degradedState.ip.qualityScore);
+    const ipTagLabel = ipQualityFresh ? (degradedState.ip.qualityLabel || ipInfo.label || t('monitorUnknown')) :
+      (ipHasCache ? (degradedState.ip.qualityLabel || ipInfo.label || t('monitorUnknown')) : t('monitorUnknown'));
+    const ipMiniLabel = ipQualityFresh ? (ipInfo.short || ipInfo.label || t('monitorUnknown')) :
+      (ipHasCache ? (ipInfo.short || ipInfo.label || t('monitorUnknown')) : t('monitorUnknown'));
+    const ipTip = (degradedState.ip.historyTooltip || degradedState.ip.qualityTooltip || t('monitorIpTip')) +
+      (ipQualityFresh ? '' : `\n${getStaleHint(degradedState.ip.qualityAt)}`);
+    if (ipEl) {
+      ipEl.textContent = degradedState.ip.masked || '--';
+      ipEl.style.color = ipColor;
+      ipEl.setAttribute('data-tooltip', ipTip);
+      if (!ipEl[DEG_IP_CLICK_KEY]) {
+        ipEl[DEG_IP_CLICK_KEY] = true;
+        ipEl.addEventListener('click', async () => {
+          const historyText = formatIPLogs(getIPLogs());
+          if (!historyText) return;
+          const prev = ipEl.textContent;
+          try {
+            await navigator.clipboard.writeText(historyText);
+            ipEl.textContent = t('monitorCopied');
+          }
+          catch {
+            ipEl.textContent = t('monitorCopyFailed');
+          }
+          setTimeout(() => {
+            ipEl.textContent = prev;
+          }, 1200);
+        });
+      }
+    }
+    if (ipTagEl) {
+      ipTagEl.textContent = ipTagLabel;
+      ipTagEl.style.color = ipColor;
+      const ipBorder = toRgba(ipColor, 0.55);
+      const ipBg = toRgba(ipColor, 0.14);
+      const ipOuter = toRgba(ipColor, 0.22);
+      ipTagEl.style.borderColor = ipBorder || '';
+      ipTagEl.style.background = ipBg || '';
+      ipTagEl.style.boxShadow = ipOuter ? `0 6px 14px ${ipOuter}` : '';
+      ipTagEl.setAttribute('data-tooltip', degradedState.ip.qualityTooltip || t('monitorIpTip'));
+      if (ipTagEl.dataset.bound !== '1') {
+        ipTagEl.dataset.bound = '1';
+        ipTagEl.addEventListener('click', () => {
+          if (!degradedState.ip.full) return;
+          PAGE_WIN.open(`https://scamalytics.com/ip/${degradedState.ip.full}`, '_blank');
+        });
+      }
+    }
+    if (ipBadgeEl) {
+      const warp = degradedState.ip.warp;
+      const showWarp = warp === 'on' || warp === 'plus';
+      ipBadgeEl.style.display = showWarp ? '' : 'none';
+      if (showWarp) {
+        ipBadgeEl.textContent = warp === 'plus' ? 'warp+' : 'warp';
+        ipBadgeEl.setAttribute('data-tooltip', 'Cloudflare WARP detected');
+      }
+    }
+
+    const powValueEl = root.querySelector('#' + DEG_POW_VALUE_ID);
+    const powTagEl = root.querySelector('#' + DEG_POW_TAG_ID);
+    const powBarEl = root.querySelector('#' + DEG_POW_BAR_ID);
+    const powFresh = isFresh(degradedState.pow.updatedAt, DEG_POW_TTL_MS);
+    const powAvailable = !!degradedState.pow.updatedAt;
+    const powColor = powFresh ? degradedState.pow.color : '#9ca3af';
+    const powValue = powAvailable
+      ? (degradedState.pow.difficulty || 'N/A')
+      : t('monitorPowWaiting');
+    let powLabel = powAvailable ? (degradedState.pow.levelLabel || t('monitorUnknown')) : t('monitorUnknown');
+    // Use compact Chinese labels for the mini tags in the top bar.
+    if (lang === 'zh') {
+      const compact = compactRiskLabelByKey(degradedState.pow.levelKey);
+      powLabel = powAvailable ? compact : t('monitorUnknown');
+    }
+    const powPct = powAvailable ? Math.max(0, Math.min(100, degradedState.pow.percentage || 0)) : 0;
+    if (powValueEl) {
+      powValueEl.textContent = powValue;
+      powValueEl.style.color = powColor;
+      powValueEl.setAttribute('data-tooltip', t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
+    }
+    if (powTagEl) {
+      powTagEl.textContent = powLabel;
+      powTagEl.style.color = powColor;
+      powTagEl.setAttribute('data-tooltip', t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
+    }
+    if (powBarEl) {
+      powBarEl.style.width = `${powPct}%`;
+      powBarEl.style.background = `linear-gradient(90deg, ${powColor}, ${powColor})`;
+    }
+
+    const topSvc = root.querySelector('#' + TOP_SVC_TAG_ID);
+    const topIp = root.querySelector('#' + TOP_IP_TAG_ID);
+    const topPow = root.querySelector('#' + TOP_POW_TAG_ID);
+    const powMiniText = powAvailable ? powLabel : t('monitorPowWaiting');
+    paintMiniItem(topSvc, formatMiniLabel('service', serviceTag), serviceFresh ? serviceInfo.color : '#9ca3af', serviceTip);
+    paintMiniItem(topIp, formatMiniLabel('ip', ipMiniLabel), ipColor, ipTip);
+    paintMiniItem(topPow, formatMiniLabel('pow', powMiniText), powColor, t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
+
+    const section = root.querySelector('#' + DEG_SECTION_ID);
+    if (section) {
+      section.classList.remove('warn', 'bad');
+      if (degraded?.severity === 'bad') section.classList.add('bad');
+      else if (degraded?.severity === 'warn') section.classList.add('warn');
+    }
+  }
+
+  function scheduleDeferredFullUI() {
+    if (deferredFullUiScheduled) return;
+    deferredFullUiScheduled = true;
+    const run = () => {
+      deferredFullUiScheduled = false;
+      updateUI(true);
+    };
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(run, { timeout: INIT_LIGHT_UI_MS + 400 });
+    }
+    else {
+      setTimeout(run, INIT_LIGHT_UI_MS);
+    }
+  }
+
+  // ========================== UI：刷新面板数据 ==========================
+  function updateUI(force) {
+    if (document.hidden) return;
+    const root = ensureRoot();
+
+    updateChatBusy(true);
+    const now = Date.now();
+    const open = root.classList.contains('open');
+    const busy = autoPauseOnChat && chatBusy;
+    const fullInterval = busy
+      ? UI_FULL_REFRESH_BUSY_MS
+      : (open ? UI_FULL_REFRESH_OPEN_MS : UI_FULL_REFRESH_CLOSED_MS);
+    const doFull = !!force || !uiCache.at || !lastUiFullAt || (now - lastUiFullAt) >= fullInterval;
+    const initAge = now - SESSION_STARTED_AT;
+    const lightInit = !force && !open && !uiCache.at && initAge < INIT_LIGHT_UI_MS;
+
+    let domNodes = 0;
+    let usedMB = null;
+    let plan = null;
+    let turns = 0;
+
+    if (lightInit) {
+      domNodes = Number.NaN;
+      usedMB = null;
+      plan = uiCache.plan || marginCache;
+      turns = uiCache.turns || lastTurnsCount || 0;
+      scheduleDeferredFullUI();
+    }
+    else if (doFull) {
+      domNodes = getDomNodeCount();
+      usedMB = getUsedHeapMB();
+      plan = getDynamicMargins();
+      turns = getTurnsCountCached(false) || lastTurnsCount || 0;
+      if (turns) lastTurnsCount = turns;
+      uiCache = {
+        at: now,
+        domNodes,
+        usedMB,
+        turns,
+        plan
+      };
+      lastUiFullAt = now;
+    }
+    else {
+      domNodes = uiCache.domNodes;
+      usedMB = uiCache.usedMB;
+      plan = uiCache.plan || getDynamicMargins();
+      turns = uiCache.turns || lastTurnsCount || 0;
+    }
+
+    const memInfo = memoryLevel(usedMB);
+    const domInfo = domLevel(domNodes);
+    const degraded = getDegradedHealth();
+    const autoHardDom = plan.autoHardDom || AUTO_HARD_DOM_THRESHOLD;
+    const autoHardExit = plan.autoHardExit || AUTO_HARD_EXIT_DOM;
+
+    const virt = virtualizationEnabled ? (lastVirtualizedCount || 0) : 0;
+
+    const remainTurns = estimateRemainingTurns(usedMB, turns);
+    const remainText = (remainTurns == null) ? (lang === 'zh' ? '不可估算' : 'N/A') : (lang === 'zh' ? `${remainTurns} 轮左右` : `~${remainTurns} turns`);
+
+    const pausedByChat = autoPauseOnChat && chatBusy;
+    const pauseReason = getPauseReason();
+    const displayPauseReason = (pauseReason === 'chat') ? '' : pauseReason;
+    const paused = !!displayPauseReason;
+    const loadReady = isAutoOptimizeReady(turns);
+    if (autoHardDom && virtualizationEnabled && !ctrlFFreeze && !pausedByChat && loadReady) {
+      if (domNodes >= autoHardDom && !hardActive && (now - lastAutoHardAt) > AUTO_HARD_COOLDOWN_MS) {
+        hardActive = true;
+        hardActiveSource = 'auto';
+        autoHardBelowAt = 0;
+        lastAutoHardAt = now;
+        logEvent('info', 'hard.auto', {
+          domNodes,
+          threshold: autoHardDom
+        });
+        scheduleVirtualize();
+      }
+    }
+    if (virtualizationEnabled && hardActive && hardActiveSource === 'auto') {
+      if (!loadReady) {
+        if (clearAutoHard('auto', domNodes)) scheduleVirtualize();
+      }
+      else if (domNodes <= autoHardExit) {
+        if (!autoHardBelowAt) autoHardBelowAt = now;
+        if ((now - autoHardBelowAt) >= AUTO_HARD_EXIT_MS) {
+          if (clearAutoHard('auto', domNodes)) scheduleVirtualize();
+        }
+      }
+      else {
+        autoHardBelowAt = 0;
+      }
+    }
+    else {
+      autoHardBelowAt = 0;
+    }
+
+    const gate = getOptimizeGateStatus(now, turns);
+    const standby = virtualizationEnabled && !gate.loadReady && !gate.manualOverride;
+    const standbyShort = standby ? t('optimizeBelowThreshold') : '';
+    const standbyText = standby ? t('optimizeStandby') : '';
+
+    if (optimizeGateReady == null) {
+      optimizeGateReady = gate.ready;
+    }
+    else if (optimizeGateReady !== gate.ready) {
+      optimizeGateReady = gate.ready;
+      logEvent('info', 'optimize.gate', {
+        ready: gate.ready,
+        loadReady: gate.loadReady,
+        manualOverride: gate.manualOverride,
+        turns,
+        domNodes,
+        memMB: usedMB == null ? null : Number(usedMB.toFixed(1))
+      });
+      if (virtualizationEnabled && !ctrlFFreeze && !pausedByChat) {
+        scheduleVirtualize();
+      }
+    }
+    const hardHint = autoHardDom ? (lang === 'zh' ? `硬阈值≥${autoHardDom}` : `hard ≥${autoHardDom}`) : '';
+    let virtModeLabel = '';
+    if (!useSoftVirtualization) {
+      virtModeLabel = lang === 'zh' ? '硬(不支持软)' : 'Hard (no soft)';
+    }
+    else if (hardActive) {
+      virtModeLabel = lang === 'zh'
+        ? (hardActiveSource === 'auto' ? '混合·硬(自动)' : '混合·硬(手动)')
+        : (hardActiveSource === 'auto' ? 'Hybrid · Hard (auto)' : 'Hybrid · Hard (manual)');
+    }
+    else {
+      virtModeLabel = lang === 'zh'
+        ? (hardHint ? `软（${hardHint}）` : '软')
+        : (hardHint ? `Soft (${hardHint})` : 'Soft');
+    }
+    const virtSuffix = ` · ${virtModeLabel}`;
+    const idleHint = standbyText || (lang === 'zh' ? '当前无需虚拟化' : 'no need now');
+    const virtText = (!virtualizationEnabled) ?
+      (lang === 'zh' ? '已暂停（完整显示）' : 'Paused (full visible)') :
+      (ctrlFFreeze ?
+        ((lang === 'zh' ? '暂停中（Ctrl+F 搜索兼容）' : 'Paused (Find active)') + virtSuffix) :
+        (virt > 0 ? ((lang === 'zh' ? `开启（已虚拟化 ${virt} 条）` : `On (${virt} virtualized)`) + virtSuffix) : ((lang === 'zh' ? `开启（${idleHint}）` : `On (${idleHint})`) + virtSuffix))
+      );
+
+    let worst =
+      (!virtualizationEnabled) ? 'off' :
+      (memInfo.level === 'bad' || domInfo.level === 'bad') ? 'bad' :
+      (memInfo.level === 'warn' || domInfo.level === 'warn') ? 'warn' :
+      'ok';
+    if (worst !== 'off') {
+      if (degraded.severity === 'bad') worst = 'bad';
+      else if (degraded.severity === 'warn' && worst === 'ok') worst = 'warn';
+    }
+
+    logHealthIfNeeded({
+      worst,
+      memLevel: memInfo.level,
+      domLevel: domInfo.level,
+      degradedSeverity: degraded.severity,
+      serviceSev: degraded.serviceSev,
+      ipSev: degraded.ipSev,
+      powSev: degraded.powSev,
+      turns,
+      virt,
+      enabled: virtualizationEnabled,
+      ctrlF: ctrlFFreeze,
+      chatBusy: pausedByChat,
+      autoPause: autoPauseOnChat,
+      memMB: usedMB == null ? null : Number(usedMB.toFixed(1)),
+      domNodes
+    });
+
+    const dot = root.querySelector('#' + DOT_ID);
+    if (dot) {
+      dot.classList.remove('warn', 'bad', 'off');
+      if (worst === 'warn') dot.classList.add('warn');
+      if (worst === 'bad') dot.classList.add('bad');
+      if (worst === 'off') dot.classList.add('off');
+    }
+
+    const statusLabel =
+      worst === 'bad' ? (lang === 'zh' ? '危险' : 'Risk') :
+      worst === 'warn' ? (lang === 'zh' ? '注意' : 'Caution') :
+      worst === 'off' ? (lang === 'zh' ? '暂停' : 'Paused') :
+      (lang === 'zh' ? '健康' : 'Healthy');
+    const stateLabel = paused ? t('statePaused') : t('stateRunning');
+    const topStatusText = `${modeLabel(currentMode)} · ${statusLabel}`;
+    const panelStatusText = `${stateLabel} · ${statusLabel}`;
+    const statusColor =
+      worst === 'bad' ? '#ef4444' :
+      worst === 'warn' ? '#f59e0b' :
+      worst === 'off' ? '#9ca3af' :
+      '#10b981';
+
+    const mini = root.querySelector('#' + STATUS_TEXT_ID);
+    if (mini) {
+      mini.textContent = topStatusText;
+    }
+    const statusPill = root.querySelector('#' + STATUS_PILL_ID);
+    if (statusPill) {
+      statusPill.classList.remove('ok', 'warn', 'bad', 'off');
+      if (worst === 'bad') statusPill.classList.add('bad');
+      else if (worst === 'warn') statusPill.classList.add('warn');
+      else if (worst === 'off') statusPill.classList.add('off');
+      else statusPill.classList.add('ok');
+    }
+
+    const statusMain = root.querySelector('[data-k="statusMain"]');
+    if (statusMain) {
+      statusMain.textContent = panelStatusText;
+      statusMain.style.color = statusColor;
+    }
+
+    const reasonEl = root.querySelector('#' + STATUS_REASON_ID);
+    if (reasonEl) {
+      let reasonText = pauseReasonText(displayPauseReason);
+      if (!paused) {
+        const reasons = [];
+        if (degraded.serviceSev === 'bad' || degraded.serviceSev === 'warn') reasons.push(t('monitorService'));
+        if (degraded.ipSev === 'bad' || degraded.ipSev === 'warn') reasons.push(t('monitorIp'));
+        if (degraded.powSev === 'bad' || degraded.powSev === 'warn') reasons.push(t('monitorPow'));
+        if (reasons.length) {
+          reasonText = lang === 'zh'
+            ? `监控提示：${reasons.join(' / ')} 偏高`
+            : `Monitor: ${reasons.join(' / ')} is elevated.`;
+        }
+      }
+      reasonEl.textContent = reasonText;
+    }
+
+    const setText = (k, v) => {
+      const el = root.querySelector(`[data-k="${k}"]`);
+      if (el) el.textContent = v;
+    };
+
+    const softScreens = plan.soft;
+    const hardScreens = plan.hard;
+    const showPlan = Number.isFinite(softScreens) && Number.isFinite(hardScreens);
+    let modeText = modeLabel(currentMode);
+    if (showPlan) {
+      const planSuffix = standbyShort ? (lang === 'zh' ? `，${standbyShort}` : `, ${standbyShort}`) : '';
+      modeText = (lang === 'zh') ?
+        `${modeLabel(currentMode)}（规划·软×${softScreens} / 硬×${hardScreens}屏${planSuffix}）` :
+        `${modeLabel(currentMode)} (Plan: Soft ×${softScreens} / Hard ×${hardScreens}${planSuffix})`;
+    }
+    setText('mode', modeText);
+    setText('dom', domInfo.label);
+
+    const memEl = root.querySelector(`[data-k="mem"]`);
+    if (memEl) {
+      memEl.textContent = memInfo.label;
+      memEl.classList.remove('mem-ok', 'mem-warn', 'mem-bad');
+      if (memInfo.level === 'ok') memEl.classList.add('mem-ok');
+      if (memInfo.level === 'warn') memEl.classList.add('mem-warn');
+      if (memInfo.level === 'bad') memEl.classList.add('mem-bad');
+    }
+
+    setText('virt', virtText);
+    setText('turns', `${turns}`);
+    setText('remain', remainText);
+    setText('tip', suggestionText(domNodes, usedMB, virt, turns));
+
+    const toggleBtn = root.querySelector('#cgpt-vs-toggle');
+    if (toggleBtn) {
+      if (!virtualizationEnabled) {
+        toggleBtn.textContent = lang === 'zh' ? '启用' : 'Enable';
+        toggleBtn.classList.remove('active', 'paused');
+      }
+      else if (paused) {
+        toggleBtn.textContent = lang === 'zh' ? '暂停中' : 'Paused';
+        toggleBtn.classList.remove('active');
+        toggleBtn.classList.add('paused');
+      }
+      else {
+        toggleBtn.textContent = lang === 'zh' ? '暂停' : 'Pause';
+        toggleBtn.classList.add('active');
+        toggleBtn.classList.remove('paused');
+      }
+    }
+
+    const pinBtn = root.querySelector('#cgpt-vs-pin');
+    if (pinBtn) pinBtn.textContent = pinned ? (lang === 'zh' ? '📌已钉' : '📌Pinned') : (lang === 'zh' ? '📌钉住' : '📌Pin');
+
+    const optimizeBtn = root.querySelector('#' + OPTIMIZE_BTN_ID);
+    if (optimizeBtn) {
+      optimizeBtn.textContent = t('optimizeSoft');
+      optimizeBtn.title = t('optimizeSoftTip');
+    }
+
+    const newBtn = root.querySelector('#cgpt-vs-newChat');
+    if (newBtn) newBtn.textContent = t('newChat');
+
+    const autoPauseBtn = root.querySelector('#' + AUTO_PAUSE_BTN_ID);
+    if (autoPauseBtn) {
+      autoPauseBtn.textContent = autoPauseOnChat ?
+        (lang === 'zh' ? `${t('autoPause')}：开` : `${t('autoPause')}: On`) :
+        (lang === 'zh' ? `${t('autoPause')}：关` : `${t('autoPause')}: Off`);
+      autoPauseBtn.title = t('autoPauseTip');
+      autoPauseBtn.classList.toggle('active', autoPauseOnChat);
+    }
+
+    const logExportBtn = root.querySelector('#' + LOG_EXPORT_BTN_ID);
+    if (logExportBtn) {
+      logExportBtn.textContent = t('logExport');
+      logExportBtn.title = t('logExportTip');
+    }
+
+    const latestBtn = root.querySelector('#' + SCROLL_LATEST_BTN_ID);
+    if (latestBtn) {
+      latestBtn.textContent = t('scrollLatest');
+      latestBtn.title = t('scrollLatestTip');
+      latestBtn.classList.remove('active');
+    }
+
+    const pauseTag = root.querySelector('#' + TOP_PAUSE_TAG_ID);
+    if (pauseTag) {
+      const pauseText = pauseTag.querySelector('.cgpt-vs-miniText');
+      const pauseDot = pauseTag.querySelector('.cgpt-vs-miniDot');
+      if (paused) {
+        const label = pauseReasonLabel(displayPauseReason) || t('statePaused');
+        if (pauseText) pauseText.textContent = label;
+        pauseTag.style.display = '';
+        pauseTag.classList.add('pause');
+        pauseTag.setAttribute('data-tooltip', pauseReasonText(displayPauseReason));
+        if (pauseDot) {
+          pauseDot.style.background = '#f59e0b';
+          pauseDot.style.boxShadow = '0 0 0 2px rgba(245,158,11,0.2)';
+        }
+      }
+      else {
+        pauseTag.style.display = 'none';
+        pauseTag.classList.remove('pause');
+        pauseTag.removeAttribute('data-tooltip');
+        if (pauseDot) {
+          pauseDot.style.background = '';
+          pauseDot.style.boxShadow = '';
+        }
+      }
+    }
+
+    const optTag = root.querySelector('#' + TOP_OPT_TAG_ID);
+    if (optTag) {
+      const optText = optTag.querySelector('.cgpt-vs-miniText');
+      const optDot = optTag.querySelector('.cgpt-vs-miniDot');
+      const optimizing = isOptimizingNow();
+      const yielding = pausedByChat;
+      const label = yielding
+        ? (lang === 'zh' ? '避让中' : 'Yielding')
+        : (optimizing ? (lang === 'zh' ? '优化中' : 'Optimizing') : (lang === 'zh' ? '空闲' : 'Idle'));
+      const color = yielding ? '#f59e0b' : (optimizing ? '#3b82f6' : '#9ca3af');
+      if (optText) optText.textContent = formatMiniLabel('opt', label);
+      optTag.classList.toggle('optimizing', optimizing && !yielding);
+      optTag.classList.toggle('pause', yielding);
+      optTag.setAttribute('data-tooltip', yielding
+        ? (lang === 'zh' ? '回复生成中，优化已避让' : 'Assistant replying: optimization yields temporarily')
+        : (optimizing ? (lang === 'zh' ? '正在优化渲染负载' : 'Optimization in progress') : (lang === 'zh' ? '未进行优化' : 'No optimization running')));
+      if (optDot) {
+        optDot.style.background = color;
+        optDot.style.boxShadow = yielding
+          ? '0 0 0 2px rgba(245,158,11,0.2)'
+          : (optimizing ? '0 0 0 2px rgba(59,130,246,0.2)' : '0 0 0 2px rgba(156,163,175,0.2)');
+      }
+      optTag.style.borderColor = '';
+      optTag.style.background = '';
+      optTag.style.boxShadow = '';
+      optTag.style.color = yielding ? '' : (optimizing ? '#1d4ed8' : '');
+    }
+
+    placeMoodSection();
+    updateMoodUI(false);
+    updateDegradedUI(root, degraded);
+    if (root.classList.contains('booting')) {
+      root.classList.remove('booting');
+    }
+  }
+
+  // endregion: UI Render & Bindings
+  // region: Route Guards & Boot
+  // ========================== 路由守护：切换对话不消失 ==========================
+  function startRouteGuards() {
+    setInterval(() => {
+      const root = document.getElementById(ROOT_ID);
+      if (!root || !document.body.contains(root)) {
+        try {
+          logEvent('warn', 'route.rebuild', {
+            reason: !root ? 'missing' : 'detached'
+          });
+          ensureRoot();
+          applyPinnedState();
+          updateUI();
+          scheduleVirtualize();
+          if (pinned) stopFollowPositionLoop();
+          else startFollowPositionLoop();
+        }
+        catch {}
+      }
+      else {
+        // Avoid moving the top bar while the panel is open.
+        if (!pinned && !root.classList.contains('open')) positionNearModelButton();
+        // Feature Pack 容器丢失时重绘
+        renderFeaturePack(false);
+        ensureThemeObservation();
+        installScrollHook();
+      }
+    }, ROUTE_GUARD_MS);
+  }
+
+  // ========================== 启动 ==========================
+  function boot() {
+    PAGE_WIN.CGPT_VS = PAGE_WIN.CGPT_VS || {};
+    PAGE_WIN.CGPT_VS.dump = dumpLogs;
+    PAGE_WIN.CGPT_VS.exportLogs = exportLogsToFile;
+    PAGE_WIN.CGPT_VS.setLogLevel = setLogLevel;
+    PAGE_WIN.CGPT_VS.setLogConsole = setLogConsole;
+    PAGE_WIN.CGPT_VS.getState = getStateSnapshot;
+    PAGE_WIN.CGPT_VS.setChatPause = setChatPause;
+    PAGE_WIN.CGPT_VS.scrollToLatest = scrollToLatest;
+    PAGE_WIN.CGPT_VS.refreshMonitor = () => {
+      ensureFetchHook();
+      ensureXhrHook();
+      refreshServiceStatus(true);
+      refreshIPInfo(true);
+      refreshPowViaRequirements(true);
+    };
+
+    logEvent('info', 'boot.start', {
+      version: SCRIPT_VERSION,
+      url: location.href,
+      lang,
+      mode: currentMode,
+      enabled: virtualizationEnabled,
+      pinned,
+      autoPauseOnChat,
+      logLevel,
+      logToConsole,
+      hint: 'Run CGPT_VS.dump() when lag occurs.'
+    });
+
+    applyDegradedCache(loadDegradedCache());
+    if (!degradedState.ip.historyTooltip) updateIpHistoryTooltip();
+
+    ensureRoot();
+    startThemeObserver();
+    startDegradedMonitors();
+    applyPinnedState();
+    if (pinned) stopFollowPositionLoop();
+    else startFollowPositionLoop();
+
+    installFindGuards();
+    installTypingDim();
+    installImageLoadHook();
+    installResizeFix();
+    startRouteGuards();
+
+    installScrollHook();
+
+    const kickVirtualize = () => scheduleVirtualize();
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(kickVirtualize, { timeout: INIT_LIGHT_UI_MS + 400 });
+    }
+    else {
+      setTimeout(kickVirtualize, INIT_VIRTUALIZE_DELAY_MS);
+    }
+    updateUI();
+
+    setInterval(() => updateUI(), CHECK_INTERVAL_MS);
+    logEvent('info', 'boot.ready');
+
+    PAGE_WIN.addEventListener('error', (e) => {
+      if (!e) return;
+      logEvent('warn', 'window.error', {
+        message: e.message,
+        filename: e.filename,
+        lineno: e.lineno,
+        colno: e.colno
+      });
+    });
+
+    window.addEventListener('unhandledrejection', (e) => {
+      const reason = e && e.reason ? String(e.reason) : 'unknown';
+      logEvent('warn', 'window.unhandledRejection', {
+        reason
+      });
+    });
+  }
+
+  let booted = false;
+  function safeBoot() {
+    if (booted) return;
+    if (!document.body) {
+      setTimeout(safeBoot, 200);
+      return;
+    }
+    booted = true;
+    boot();
+  }
+
+  try {
+    ensureFetchHook();
+    ensureXhrHook();
+    startFetchMonitor();
+  }
+  catch {}
+
+  setTimeout(safeBoot, 900);
+  // endregion: Route Guards & Boot
+})();
