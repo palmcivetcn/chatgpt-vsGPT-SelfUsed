@@ -30,7 +30,17 @@ assert.equal(res.blocked, true);
 assert.equal(res.allowMaintenance, false);
 
 res = mod.evaluateIdleGate({ ...base, inputBusy: true, deferSince: 1000, now: 10000 });
+assert.equal(res.allowMaintenance, false);
+
+res = mod.evaluateIdleGate({
+  ...base,
+  now: 10000,
+  inputBusy: false,
+  scrollBusy: false,
+  deferSince: 1000
+});
 assert.equal(res.allowMaintenance, true);
+assert.equal(res.deferSince, 0);
 
 const now2 = 20000;
 res = mod.evaluateIdleGate({
@@ -45,7 +55,8 @@ assert.equal(res.allowMaintenance, false);
 res = mod.evaluateIdleGate({
   ...base,
   now: 16000,
-  inputBusy: true,
+  inputBusy: false,
+  scrollBusy: false,
   deferSince: 2000,
   maintenanceAt: 15000,
   maintenanceCooldownMs: 3000
