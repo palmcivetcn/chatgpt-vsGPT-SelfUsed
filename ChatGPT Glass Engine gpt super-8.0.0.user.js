@@ -85,7 +85,7 @@
   const SCROLL_ROOT_TTL_MS = 3200;
   const MARGIN_TTL_MS = 2400;
   const TURNS_COUNT_TTL_MS = 900;
-  const MARGIN_TURN_STEPS = [80, 180, 320, 520];
+  const MARGIN_TURN_STEPS = [80, 220, 360, 520];
   const MODEL_BTN_TTL_MS = 3000;
   const OPTIMIZE_HOLD_MS = 420;
   const HARD_SLICE_TURNS = 140;
@@ -231,6 +231,7 @@
       optimizeSoftTip: '自动优化：根据负载规划软/硬与屏数',
       optimizeStandby: '未达阈值，待优化',
       optimizeBelowThreshold: '未达阈值',
+      optimizeReachedThreshold: '达到阈值',
       optimizeHard: '硬优化',
       optimizeHardTip: '硬虚拟化：远距内容替换为占位，显著降低 DOM',
       newChat: '新开对话',
@@ -243,7 +244,7 @@
       sectionStatus: '状态总览',
       sectionRuntime: '运行控制',
       sectionOptimize: '优化操作',
-      sectionStats: '性能读数',
+      sectionStats: '性能面板',
       sectionMonitor: '降级监控',
       stateRunning: '运行中',
       statePaused: '暂停中',
@@ -269,7 +270,7 @@
       logExport: '导出日志',
       logExportTip: '下载诊断日志（txt）',
       logExported: '已导出',
-      moodTitle: '每日名言',
+      moodTitle: '每日一言',
       moodTip: '点击换一句',
       moodSub: '给今天一点轻松感',
       riskVeryEasy: '非常容易',
@@ -285,6 +286,7 @@
       optimizeSoftTip: 'Auto optimize: plan soft/hard and screen ranges by load',
       optimizeStandby: 'standby, below threshold',
       optimizeBelowThreshold: 'Below threshold',
+      optimizeReachedThreshold: 'Threshold met',
       optimizeHard: 'Hard Optimize',
       optimizeHardTip: 'Hard mode: replace far content to reduce DOM',
       newChat: 'New chat',
@@ -1329,8 +1331,6 @@
 
   function markMarginCacheDirty() {
     marginCache.at = 0;
-    marginCache.overrideUntil = 0;
-    marginCache.overrideReason = '';
   }
 
   function markMsgCacheDirty() {
@@ -2882,6 +2882,108 @@
     return v;
   }
 
+  function parseRgbLike(raw) {
+    const m = String(raw || '').match(/rgba?\(([^)]+)\)/i);
+    if (!m) return null;
+    let body = m[1].trim();
+    if (!body) return null;
+    if (body.includes('/')) {
+      body = body.split('/')[0].trim();
+    }
+    const parts = body.split(/[\s,]+/).filter(Boolean);
+    if (parts.length < 3) return null;
+    const r = Number.parseFloat(parts[0]);
+    const g = Number.parseFloat(parts[1]);
+    const b = Number.parseFloat(parts[2]);
+    if ([r, g, b].some((v) => Number.isNaN(v))) return null;
+    return { r, g, b };
+  }
+
+  function toRgba(value, alpha) {
+    if (!value || typeof value !== 'string') return '';
+    let h = value.trim();
+    const rgb = parseRgbLike(h);
+    if (rgb) return `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+    if (!h.startsWith('#')) return '';
+    if (h.length === 4) {
+      h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
+    }
+    else if (h.length === 5) {
+      h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}${h[4]}${h[4]}`;
+    }
+    if (h.length === 9) h = h.slice(0, 7);
+    if (h.length !== 7) return '';
+    const r = parseInt(h.slice(1, 3), 16);
+    const g = parseInt(h.slice(3, 5), 16);
+    const b = parseInt(h.slice(5, 7), 16);
+    if ([r, g, b].some((v) => Number.isNaN(v))) return '';
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+
+  function paintMiniItem(item, label, color, tooltip, opts = {}) {
+    if (!item) return;
+    const dot = item.querySelector('.cgpt-vs-miniDot');
+    const textEl = item.querySelector('.cgpt-vs-miniText');
+    if (label != null && textEl) textEl.textContent = label;
+    if (tooltip) item.setAttribute('data-tooltip', tooltip);
+    if (!color) {
+      item.style.color = '';
+      item.style.borderColor = '';
+      item.style.background = '';
+      item.style.boxShadow = '';
+      if (dot) {
+        dot.style.background = '';
+        dot.style.boxShadow = '';
+      }
+      return;
+    }
+    const borderAlpha = Number.isFinite(opts.borderAlpha) ? opts.borderAlpha : 0.62;
+    const bgAlpha = Number.isFinite(opts.bgAlpha) ? opts.bgAlpha : 0.24;
+    const bgAlpha2 = Number.isFinite(opts.bgAlpha2) ? opts.bgAlpha2 : 0.1;
+    const shadowAlpha = Number.isFinite(opts.shadowAlpha) ? opts.shadowAlpha : 0.18;
+    const glowAlpha = Number.isFinite(opts.glowAlpha) ? opts.glowAlpha : 0.22;
+    const border = toRgba(color, borderAlpha);
+    const bgA = toRgba(color, bgAlpha);
+    const bgB = toRgba(color, bgAlpha2);
+    const shadow = toRgba(color, shadowAlpha);
+    item.style.color = opts.textColor || color;
+    if (border) item.style.borderColor = border;
+    if (bgA || bgB) item.style.background = `linear-gradient(140deg, ${bgA || 'transparent'}, ${bgB || 'transparent'})`;
+    if (shadow) item.style.boxShadow = `0 8px 18px ${shadow}, inset 0 1px 0 rgba(255,255,255,0.65)`;
+    if (dot) {
+      dot.style.background = color;
+      const glow = toRgba(color, glowAlpha);
+      if (glow) dot.style.boxShadow = `0 0 0 2px ${glow}`;
+    }
+  }
+
+  function paintDegradedTag(item, color, opts = {}) {
+    if (!item) return;
+    if (!color) {
+      item.style.color = '';
+      item.style.borderColor = '';
+      item.style.background = '';
+      item.style.boxShadow = '';
+      item.style.removeProperty('--cgpt-vs-tag-tint');
+      return;
+    }
+    const borderAlpha = Number.isFinite(opts.borderAlpha) ? opts.borderAlpha : 0.55;
+    const bgAlpha = Number.isFinite(opts.bgAlpha) ? opts.bgAlpha : 0.22;
+    const bgAlpha2 = Number.isFinite(opts.bgAlpha2) ? opts.bgAlpha2 : 0.12;
+    const shadowAlpha = Number.isFinite(opts.shadowAlpha) ? opts.shadowAlpha : 0.18;
+    const tintAlpha = Number.isFinite(opts.tintAlpha) ? opts.tintAlpha : 0.32;
+    const border = toRgba(color, borderAlpha);
+    const bgA = toRgba(color, bgAlpha);
+    const bgB = toRgba(color, bgAlpha2);
+    const shadow = toRgba(color, shadowAlpha);
+    const tint = toRgba(color, tintAlpha);
+    item.style.color = color;
+    if (border) item.style.borderColor = border;
+    if (bgA || bgB) item.style.background = `linear-gradient(140deg, ${bgA || 'transparent'}, ${bgB || 'transparent'})`;
+    if (shadow) item.style.boxShadow = `0 8px 18px ${shadow}, inset 0 1px 0 rgba(255,255,255,0.65)`;
+    if (tint) item.style.setProperty('--cgpt-vs-tag-tint', tint);
+  }
+
   function getMoodLines() {
     return lang === 'zh' ? [
       '慢一点，也是一种前进。',
@@ -3688,8 +3790,8 @@
     softObserverMargin = margin;
     softObserverRoot = rootEl;
     softObserver = new IntersectionObserver((entries) => {
-    const pausedByChat = autoPauseOnChat && chatBusy;
-    const active = virtualizationEnabled && !ctrlFFreeze && !pausedByChat;
+      const pausedByChat = autoPauseOnChat && chatBusy;
+      const active = virtualizationEnabled && !ctrlFFreeze && !pausedByChat;
       for (const entry of entries) {
         const el = entry.target;
         if (entry.isIntersecting) {
@@ -3843,6 +3945,8 @@
     currentMode = mode;
     localStorage.setItem(KEY_MODE, mode);
     markMarginCacheDirty();
+    marginCache.overrideUntil = 0;
+    marginCache.overrideReason = '';
   }
 
   function loadPos() {
@@ -3888,6 +3992,14 @@
     if (turns < MARGIN_TURN_STEPS[2]) return -1;
     if (turns < MARGIN_TURN_STEPS[3]) return -2;
     return -3;
+  }
+
+  function getNextMarginStep(turns) {
+    const t = Math.max(0, Number(turns) || 0);
+    for (let i = 0; i < MARGIN_TURN_STEPS.length; i += 1) {
+      if (t < MARGIN_TURN_STEPS[i]) return MARGIN_TURN_STEPS[i];
+    }
+    return null;
   }
 
   function getOptimizeProfile(mode) {
@@ -4035,7 +4147,7 @@
   function getDynamicMargins(force) {
     const now = Date.now();
     const overrideActive = marginCache.overrideUntil && now < marginCache.overrideUntil;
-    if (!force && marginCache.at && marginCache.mode === currentMode && (overrideActive || (now - marginCache.at) < MARGIN_TTL_MS)) {
+    if (!force && marginCache.mode === currentMode && (overrideActive || (marginCache.at && (now - marginCache.at) < MARGIN_TTL_MS))) {
       return marginCache;
     }
     if (marginCache.overrideUntil && now >= marginCache.overrideUntil) {
@@ -5256,13 +5368,13 @@
         --cgpt-glass-card-2: rgba(255,255,255,0.38);
         --cgpt-glass-chip: rgba(255,255,255,0.66);
         --cgpt-glass-chip-2: rgba(255,255,255,0.44);
-        --cgpt-glass-border: rgba(255,255,255,0.55);
-        --cgpt-glass-border-strong: rgba(255,255,255,0.75);
-        --cgpt-glass-highlight: rgba(255,255,255,0.75);
-        --cgpt-glass-highlight-strong: rgba(255,255,255,0.92);
+        --cgpt-glass-border: rgba(255,255,255,0.62);
+        --cgpt-glass-border-strong: rgba(255,255,255,0.82);
+        --cgpt-glass-highlight: rgba(255,255,255,0.82);
+        --cgpt-glass-highlight-strong: rgba(255,255,255,0.96);
         --cgpt-glass-shadow: 0 22px 60px rgba(15,23,42,0.16);
         --cgpt-glass-shadow-soft: 0 12px 28px rgba(15,23,42,0.08);
-        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.78);
+        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.86);
         transform: translateZ(0);
         opacity: 1;
         transition: opacity 160ms ease;
@@ -5656,29 +5768,42 @@
         display:flex;
         align-items:center;
         width: 100%;
-        padding: 3px;
+        padding: 4px;
+        gap: 4px;
         border-radius: 999px;
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
-        border: 1px solid var(--cgpt-glass-border-strong);
-        box-shadow: var(--cgpt-glass-inset), var(--cgpt-glass-shadow-soft);
+        background: linear-gradient(150deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        border: 1px solid rgba(255,255,255,0.75);
+        box-shadow:
+          inset 0 0 0 1px rgba(255,255,255,0.45),
+          inset 0 -1px 0 rgba(0,0,0,0.04),
+          var(--cgpt-glass-shadow-soft);
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
         -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
       }
       .cgpt-vs-seg button{
         flex:1;
         height: 28px;
-        border: 0;
-        background: transparent;
+        border: 1px solid rgba(255,255,255,0.5);
+        background: linear-gradient(160deg, rgba(255,255,255,0.58), rgba(255,255,255,0.22));
         border-radius: 999px;
         cursor: pointer;
         font-size: 12px;
-        color: rgba(0,0,0,0.62);
+        color: rgba(0,0,0,0.7);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.8),
+          inset 0 -1px 0 rgba(0,0,0,0.04);
         transition: background 140ms ease, box-shadow 140ms ease, color 140ms ease;
       }
+      .cgpt-vs-seg button:hover{
+        background: linear-gradient(160deg, rgba(255,255,255,0.74), rgba(255,255,255,0.28));
+      }
       .cgpt-vs-seg button.active{
+        border-color: rgba(255,255,255,0.82);
         background: linear-gradient(150deg, var(--cgpt-glass-panel), var(--cgpt-glass-panel-2));
-        color: rgba(0,0,0,0.86);
-        box-shadow: 0 10px 22px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.7);
+        color: rgba(0,0,0,0.9);
+        box-shadow:
+          0 12px 26px rgba(15,23,42,0.14),
+          inset 0 1px 0 rgba(255,255,255,0.85);
       }
 
       /* ✅ 5.0 UI：控件区允许换行，避免挤爆 */
@@ -5797,7 +5922,7 @@
       .cgpt-vs-deg-value{
         display:flex;
         align-items:center;
-        gap:6px;
+        gap:4px;
         flex-wrap: wrap;
         justify-content:flex-end;
         min-width: 0;
@@ -5809,33 +5934,54 @@
         text-overflow: ellipsis;
         color: rgba(0,0,0,0.82);
       }
-      .cgpt-vs-deg-tag{
+      .cgpt-vs-deg-tag,
+      .cgpt-vs-deg-badge{
+        position: relative;
+        display:inline-flex;
+        align-items:center;
         height: 22px;
         padding: 0 8px;
         border-radius: 999px;
-        border: 1px solid var(--cgpt-glass-border);
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
-        display:inline-flex;
-        align-items:center;
+        border: 1px solid rgba(255,255,255,0.7);
+        background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
+        color: rgba(0,0,0,0.72);
         font-weight: 800;
         font-size: 11px;
-        color: rgba(0,0,0,0.76);
-        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
-        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
-        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+        backdrop-filter: blur(16px) saturate(1.3);
+        -webkit-backdrop-filter: blur(16px) saturate(1.3);
+        box-shadow:
+          0 8px 18px rgba(0,0,0,0.08),
+          inset 0 1px 0 rgba(255,255,255,0.75);
+        overflow: hidden;
+      }
+      .cgpt-vs-deg-tag::before,
+      .cgpt-vs-deg-badge::before{
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background:
+          radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.75), rgba(255,255,255,0.08) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.45), rgba(255,255,255,0.0));
+        opacity: 0.7;
+        pointer-events: none;
+      }
+      .cgpt-vs-deg-tag::after,
+      .cgpt-vs-deg-badge::after{
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: var(--cgpt-vs-tag-tint, transparent);
+        opacity: 0.25;
+        pointer-events: none;
       }
       .cgpt-vs-deg-badge{
-        height: 22px;
-        padding: 0 8px;
-        border-radius: 999px;
-        border: 1px solid rgba(16,185,129,0.35);
-        background: linear-gradient(145deg, rgba(16,185,129,0.28), rgba(16,185,129,0.12));
-        color: #047857;
-        font-weight: 800;
-        font-size: 11px;
-        display:inline-flex;
-        align-items:center;
         text-transform: lowercase;
+        --cgpt-vs-tag-tint: rgba(16,185,129,0.18);
+        color: #047857;
       }
       .cgpt-vs-deg-bar{
         margin-top: 6px;
@@ -5858,7 +6004,10 @@
       }
 
       /* Scoped tooltips */
-      #${ROOT_ID} [data-tooltip]{ position: relative; }
+      #${ROOT_ID} [data-tooltip]{
+        position: relative;
+        overflow: visible;
+      }
       #${ROOT_ID} [data-tooltip]::after{
         content: attr(data-tooltip);
         position: absolute;
@@ -5869,8 +6018,9 @@
         pointer-events: none;
         transition: opacity 140ms ease, transform 140ms ease;
         white-space: pre-line;
-        min-width: 220px;
-        max-width: 320px;
+        min-width: 0;
+        max-width: min(320px, calc(100vw - 32px));
+        width: max-content;
         padding: 8px 10px;
         border-radius: 10px;
         background: rgba(17,24,39,0.94);
@@ -5880,10 +6030,25 @@
         z-index: 2147483647;
         font-size: 11px;
         line-height: 1.55;
+        overflow-wrap: anywhere;
       }
       #${ROOT_ID} [data-tooltip]:hover::after{
         opacity: 1;
         transform: translateX(-50%) translateY(0);
+      }
+      #${ROOT_ID} .cgpt-vs-org-monitor [data-tooltip]::after{
+        left: auto;
+        right: 0;
+        transform: translateX(0) translateY(4px);
+        max-width: min(260px, calc(100vw - 32px));
+      }
+      #${ROOT_ID} .cgpt-vs-org-monitor [data-tooltip]:hover::after{
+        transform: translateX(0) translateY(0);
+      }
+      #${ROOT_ID} .cgpt-vs-org-monitor .cgpt-vs-deg-tag[data-tooltip]::after,
+      #${ROOT_ID} .cgpt-vs-org-monitor .cgpt-vs-deg-badge[data-tooltip]::after{
+        content: none;
+        display: none;
       }
       #${BTN_ID} .cgpt-vs-miniItem[data-tooltip]::after{
         top: calc(100% + 6px);
@@ -5902,11 +6067,94 @@
       }
       .cgpt-vs-k{ color: rgba(0,0,0,0.56); }
       .cgpt-vs-v{ font-variant-numeric: tabular-nums; }
+      .cgpt-vs-valueGroup{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        flex-wrap: nowrap;
+        width: 100%;
+      }
+      .cgpt-vs-valueGroup.tight{
+        justify-content: flex-end;
+        gap: 6px;
+      }
+      .cgpt-vs-valueGroup.stack{
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
+      }
+      .cgpt-vs-valueGroup.stack.reverse{
+        flex-direction: column-reverse;
+      }
+      .cgpt-vs-valueGroup.stack .cgpt-vs-tag{
+        align-self: flex-start;
+      }
+      .cgpt-vs-valueGroup.stack .cgpt-vs-valueText{
+        align-self: flex-end;
+      }
+      .cgpt-vs-valueText{
+        font-weight: 700;
+        color: rgba(0,0,0,0.82);
+        white-space: nowrap;
+      }
+      .cgpt-vs-tag{
+        position: relative;
+        display:inline-flex;
+        align-items:center;
+        height: 18px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.7);
+        background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
+        color: rgba(0,0,0,0.72);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+        backdrop-filter: blur(16px) saturate(1.3);
+        -webkit-backdrop-filter: blur(16px) saturate(1.3);
+        box-shadow:
+          0 8px 18px rgba(0,0,0,0.08),
+          inset 0 1px 0 rgba(255,255,255,0.75);
+        overflow: hidden;
+      }
+      .cgpt-vs-tag::before{
+        content: '';
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.75), rgba(255,255,255,0.08) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.45), rgba(255,255,255,0.0));
+        opacity: 0.7;
+        pointer-events: none;
+      }
+      .cgpt-vs-tag > *{ position: relative; z-index: 1; }
+      .cgpt-vs-tag.warn{
+        border-color: rgba(245,158,11,0.6);
+        background: linear-gradient(140deg, rgba(245,158,11,0.22), rgba(245,158,11,0.08));
+        color: #92400e;
+      }
+      .cgpt-vs-tag.ok{
+        border-color: rgba(16,185,129,0.6);
+        background: linear-gradient(140deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08));
+        color: #065f46;
+      }
+      .cgpt-vs-tag.bad{
+        border-color: rgba(239,68,68,0.6);
+        background: linear-gradient(140deg, rgba(239,68,68,0.22), rgba(239,68,68,0.08));
+        color: #991b1b;
+      }
       .cgpt-vs-org-stats .cgpt-vs-row{
         display: grid;
         grid-template-columns: minmax(0, 1fr) minmax(140px, 0.9fr);
         column-gap: 12px;
         align-items: baseline;
+      }
+      .cgpt-vs-org-stats .cgpt-vs-row.cgpt-vs-row-plan{
+        grid-template-columns: 1fr;
+        row-gap: 4px;
+        align-items: start;
       }
       .cgpt-vs-org-stats .cgpt-vs-k{
         min-width: 0;
@@ -5914,13 +6162,16 @@
       .cgpt-vs-org-stats .cgpt-vs-v{
         min-width: 0;
         text-align: right;
-        justify-self: end;
+        justify-self: stretch;
         word-break: break-word;
       }
 
       .mem-ok{ color:#16a34a; font-weight: 600; }
       .mem-warn{ color:#d97706; font-weight: 600; }
       .mem-bad{ color:#dc2626; font-weight: 700; }
+      .cgpt-vs-tag.mem-ok{ color:#16a34a; }
+      .cgpt-vs-tag.mem-warn{ color:#d97706; }
+      .cgpt-vs-tag.mem-bad{ color:#dc2626; }
 
       .cgpt-vs-hr{
         height: 1px;
@@ -5994,13 +6245,13 @@
         --cgpt-glass-card-2: rgba(15,23,42,0.62);
         --cgpt-glass-chip: rgba(30,41,59,0.72);
         --cgpt-glass-chip-2: rgba(15,23,42,0.56);
-        --cgpt-glass-border: rgba(255,255,255,0.12);
-        --cgpt-glass-border-strong: rgba(255,255,255,0.22);
-        --cgpt-glass-highlight: rgba(255,255,255,0.18);
-        --cgpt-glass-highlight-strong: rgba(255,255,255,0.32);
+        --cgpt-glass-border: rgba(255,255,255,0.18);
+        --cgpt-glass-border-strong: rgba(255,255,255,0.28);
+        --cgpt-glass-highlight: rgba(255,255,255,0.24);
+        --cgpt-glass-highlight-strong: rgba(255,255,255,0.4);
         --cgpt-glass-shadow: 0 22px 60px rgba(0,0,0,0.62);
         --cgpt-glass-shadow-soft: 0 14px 30px rgba(0,0,0,0.42);
-        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.08);
+        --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.12);
       }
       #${ROOT_ID}.theme-dark #${BTN_ID}{
         border-color: var(--cgpt-glass-border);
@@ -6092,19 +6343,62 @@
         background: linear-gradient(145deg, rgba(251,191,36,0.32), rgba(251,191,36,0.16));
         color: #fde68a;
       }
+      #${ROOT_ID}.theme-dark .cgpt-vs-valueText{ color: rgba(255,255,255,0.92); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag{
+        border-color: rgba(255,255,255,0.22);
+        background: linear-gradient(150deg, rgba(30,41,59,0.92), rgba(15,23,42,0.78));
+        color: rgba(255,255,255,0.9);
+        box-shadow:
+          0 10px 22px rgba(0,0,0,0.45),
+          inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag::before{
+        background:
+          radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.2), rgba(255,255,255,0.04) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.0));
+        opacity: 0.55;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.warn{
+        border-color: rgba(251,191,36,0.7);
+        background: linear-gradient(140deg, rgba(251,191,36,0.32), rgba(251,191,36,0.14));
+        color: #fde68a;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.ok{
+        border-color: rgba(52,211,153,0.62);
+        background: linear-gradient(140deg, rgba(16,185,129,0.35), rgba(16,185,129,0.16));
+        color: #d1fae5;
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.bad{
+        border-color: rgba(248,113,113,0.72);
+        background: linear-gradient(140deg, rgba(248,113,113,0.28), rgba(248,113,113,0.12));
+        color: #fecaca;
+      }
       #${ROOT_ID}.theme-dark .cgpt-vs-k{ color: rgba(255,255,255,0.64); }
       #${ROOT_ID}.theme-dark .cgpt-vs-tip{ color: rgba(255,255,255,0.82); }
       #${ROOT_ID}.theme-dark .cgpt-vs-hr{ background: rgba(255,255,255,0.12); }
       #${ROOT_ID}.theme-dark .cgpt-vs-seg{
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
-        border-color: var(--cgpt-glass-border-strong);
-        box-shadow: var(--cgpt-glass-inset), var(--cgpt-glass-shadow-soft);
+        background: linear-gradient(150deg, rgba(30,41,59,0.9), rgba(15,23,42,0.72));
+        border-color: rgba(255,255,255,0.22);
+        box-shadow:
+          inset 0 0 0 1px rgba(255,255,255,0.06),
+          0 12px 26px rgba(0,0,0,0.45);
       }
-      #${ROOT_ID}.theme-dark .cgpt-vs-seg button{ color: rgba(255,255,255,0.74); }
+      #${ROOT_ID}.theme-dark .cgpt-vs-seg button{
+        border: 1px solid rgba(255,255,255,0.14);
+        background: linear-gradient(160deg, rgba(30,41,59,0.72), rgba(15,23,42,0.52));
+        color: rgba(255,255,255,0.78);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+      }
+      #${ROOT_ID}.theme-dark .cgpt-vs-seg button:hover{
+        background: linear-gradient(160deg, rgba(51,65,85,0.8), rgba(15,23,42,0.6));
+      }
       #${ROOT_ID}.theme-dark .cgpt-vs-seg button.active{
-        background: linear-gradient(150deg, rgba(255,255,255,0.2), rgba(255,255,255,0.06));
+        border-color: rgba(255,255,255,0.28);
+        background: linear-gradient(160deg, rgba(255,255,255,0.24), rgba(255,255,255,0.08));
         color: rgba(255,255,255,0.96);
-        box-shadow: 0 12px 26px rgba(0,0,0,0.46), inset 0 1px 0 rgba(255,255,255,0.12);
+        box-shadow:
+          0 12px 26px rgba(0,0,0,0.55),
+          inset 0 1px 0 rgba(255,255,255,0.18);
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-chip{
         border-color: var(--cgpt-glass-border);
@@ -6156,16 +6450,18 @@
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-deg-title{ color: rgba(255,255,255,0.9); }
       #${ROOT_ID}.theme-dark .cgpt-vs-deg-text{ color: rgba(255,255,255,0.9); }
-      #${ROOT_ID}.theme-dark .cgpt-vs-deg-tag{
-        border-color: var(--cgpt-glass-border);
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-tag,
+      #${ROOT_ID}.theme-dark .cgpt-vs-deg-badge{
+        border-color: rgba(255,255,255,0.22);
+        background: linear-gradient(150deg, rgba(30,41,59,0.92), rgba(15,23,42,0.78));
         color: rgba(255,255,255,0.92);
-        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+        box-shadow:
+          0 10px 22px rgba(0,0,0,0.45),
+          inset 0 1px 0 rgba(255,255,255,0.08);
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-deg-badge{
-        border-color: rgba(52,211,153,0.6);
-        background: linear-gradient(145deg, rgba(16,185,129,0.34), rgba(16,185,129,0.18));
         color: #d1fae5;
+        --cgpt-vs-tag-tint: rgba(52,211,153,0.2);
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-deg-bar{
         border-color: rgba(255,255,255,0.14);
@@ -6182,6 +6478,9 @@
       #${ROOT_ID}.theme-dark .mem-ok{ color:#4ade80; }
       #${ROOT_ID}.theme-dark .mem-warn{ color:#fbbf24; }
       #${ROOT_ID}.theme-dark .mem-bad{ color:#f87171; }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.mem-ok{ color:#4ade80; }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.mem-warn{ color:#fbbf24; }
+      #${ROOT_ID}.theme-dark .cgpt-vs-tag.mem-bad{ color:#f87171; }
 
       #${HELP_ID}.theme-dark{ background: rgba(0,0,0,0.56); }
       #${HELP_ID}.theme-dark .cgpt-vs-helpCard{
@@ -6368,7 +6667,7 @@
                 <span>${t('sectionStats')}</span>
               </div>
               <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '运行模式' : 'Run Mode'}</span><span class="cgpt-vs-v" data-k="mode">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '动态规划' : 'Dynamic Plan'}</span><span class="cgpt-vs-v" data-k="plan">--</span></div>
+              <div class="cgpt-vs-row cgpt-vs-row-plan"><span class="cgpt-vs-k">${lang === 'zh' ? '动态规划' : 'Dynamic Plan'}</span><span class="cgpt-vs-v" data-k="plan">--</span></div>
               <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? 'DOM节点' : 'DOM Nodes'}</span><span class="cgpt-vs-v" data-k="dom">--</span></div>
               <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '内存（JS堆）' : 'Memory (JS Heap)'}</span><span class="cgpt-vs-v" data-k="mem">--</span></div>
               <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '对话轮次' : 'Turns'}</span><span class="cgpt-vs-v" data-k="turns">--</span></div>
@@ -6383,23 +6682,23 @@
                 <div class="cgpt-vs-row">
                   <span class="cgpt-vs-k">${t('monitorService')}</span>
                   <div class="cgpt-vs-deg-value">
-                    <span class="cgpt-vs-deg-text" id="${DEG_SERVICE_DESC_ID}" data-tooltip="${t('monitorServiceTip')}">--</span>
                     <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_SERVICE_TAG_ID}">--</span>
+                    <span class="cgpt-vs-deg-text" id="${DEG_SERVICE_DESC_ID}" data-tooltip="${t('monitorServiceTip')}">--</span>
                   </div>
                 </div>
                 <div class="cgpt-vs-row">
                   <span class="cgpt-vs-k">${t('monitorIp')}</span>
                   <div class="cgpt-vs-deg-value">
-                    <span class="cgpt-vs-deg-text monospace" id="${DEG_IP_VALUE_ID}" data-tooltip="${t('monitorIpTip')}">--</span>
                     <span class="cgpt-vs-deg-badge cgpt-vs-atom" id="${DEG_IP_BADGE_ID}" style="display:none;">warp</span>
                     <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_IP_TAG_ID}">--</span>
+                    <span class="cgpt-vs-deg-text monospace" id="${DEG_IP_VALUE_ID}" data-tooltip="${t('monitorIpTip')}">--</span>
                   </div>
                 </div>
                 <div class="cgpt-vs-row">
                   <span class="cgpt-vs-k">${t('monitorPow')}</span>
                   <div class="cgpt-vs-deg-value">
-                    <span class="cgpt-vs-deg-text monospace" id="${DEG_POW_VALUE_ID}" data-tooltip="${t('monitorPowTip')}">--</span>
                     <span class="cgpt-vs-deg-tag cgpt-vs-atom" id="${DEG_POW_TAG_ID}">--</span>
+                    <span class="cgpt-vs-deg-text monospace" id="${DEG_POW_VALUE_ID}" data-tooltip="${t('monitorPowTip')}">--</span>
                   </div>
                 </div>
                 <div class="cgpt-vs-deg-bar" data-tooltip="${t('monitorPowTip')}">
@@ -6833,62 +7132,6 @@
   function updateDegradedUI(root, degraded) {
     if (!root) return;
 
-    const toRgba = (hex, alpha) => {
-      if (!hex || typeof hex !== 'string') return '';
-      let h = hex.trim();
-      if (h.startsWith('rgb')) {
-        const m = h.match(/rgba?\(([^)]+)\)/i);
-        if (!m) return '';
-        const parts = m[1].split(',').map((v) => v.trim());
-        const r = Number.parseFloat(parts[0]);
-        const g = Number.parseFloat(parts[1]);
-        const b = Number.parseFloat(parts[2]);
-        if ([r, g, b].some((v) => Number.isNaN(v))) return '';
-        return `rgba(${r},${g},${b},${alpha})`;
-      }
-      if (!h.startsWith('#')) return '';
-      if (h.length === 4) {
-        h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
-      }
-      if (h.length !== 7) return '';
-      const r = parseInt(h.slice(1, 3), 16);
-      const g = parseInt(h.slice(3, 5), 16);
-      const b = parseInt(h.slice(5, 7), 16);
-      if ([r, g, b].some((v) => Number.isNaN(v))) return '';
-      return `rgba(${r},${g},${b},${alpha})`;
-    };
-    const paintMiniItem = (item, label, color, tooltip) => {
-      if (!item) return;
-      const dot = item.querySelector('.cgpt-vs-miniDot');
-      const textEl = item.querySelector('.cgpt-vs-miniText');
-      if (label != null && textEl) textEl.textContent = label;
-      if (tooltip) item.setAttribute('data-tooltip', tooltip);
-      if (color) {
-        item.style.color = color;
-        const border = toRgba(color, 0.55);
-        const bg = toRgba(color, 0.16);
-        const outer = toRgba(color, 0.22);
-        if (border) item.style.borderColor = border;
-        if (bg) item.style.background = bg;
-        if (outer) item.style.boxShadow = `0 0 0 1px ${border || 'rgba(0,0,0,0.1)'}, 0 6px 14px ${outer}`;
-        if (dot) {
-          dot.style.background = color;
-          const glow = toRgba(color, 0.18);
-          if (glow) dot.style.boxShadow = `0 0 0 2px ${glow}`;
-        }
-      }
-      else {
-        item.style.color = '';
-        item.style.borderColor = '';
-        item.style.background = '';
-        item.style.boxShadow = '';
-        if (dot) {
-          dot.style.background = '';
-          dot.style.boxShadow = '';
-        }
-      }
-    };
-
     const refreshBtn = root.querySelector('#' + DEG_REFRESH_BTN_ID);
     if (refreshBtn) {
       refreshBtn.textContent = t('monitorRefresh');
@@ -6912,6 +7155,7 @@
     const serviceInfo = (serviceFresh || serviceHasCache) ?
       getServiceIndicatorInfo(degradedState.service.indicator, degradedState.service.description) :
       getServiceIndicatorInfo('', '');
+    const serviceColor = (serviceFresh || serviceHasCache) ? serviceInfo.color : '#9ca3af';
     let serviceDesc = serviceFresh ? (degradedState.service.description || '--') :
       (serviceHasCache ? (degradedState.service.description || '--') : t('monitorUnknown'));
     let serviceTag = serviceFresh ?
@@ -6946,7 +7190,7 @@
     const serviceTip = `${t('monitorServiceTip')}\n${t('monitorOpenStatus')}${serviceFresh ? '' : `\n${getStaleHint(degradedState.service.updatedAt)}`}`;
     if (serviceDescEl) {
       serviceDescEl.textContent = serviceDesc;
-      serviceDescEl.style.color = serviceFresh ? serviceInfo.color : '#9ca3af';
+      serviceDescEl.style.color = serviceColor;
       serviceDescEl.setAttribute('data-tooltip', serviceTip);
       if (serviceDescEl.dataset.bound !== '1') {
         serviceDescEl.dataset.bound = '1';
@@ -6955,7 +7199,7 @@
     }
     if (serviceTagEl) {
       serviceTagEl.textContent = serviceTag;
-      serviceTagEl.style.color = serviceFresh ? serviceInfo.color : '#9ca3af';
+      paintDegradedTag(serviceTagEl, serviceColor);
       serviceTagEl.setAttribute('data-tooltip', serviceTip);
     }
 
@@ -6997,13 +7241,7 @@
     }
     if (ipTagEl) {
       ipTagEl.textContent = ipTagLabel;
-      ipTagEl.style.color = ipColor;
-      const ipBorder = toRgba(ipColor, 0.55);
-      const ipBg = toRgba(ipColor, 0.14);
-      const ipOuter = toRgba(ipColor, 0.22);
-      ipTagEl.style.borderColor = ipBorder || '';
-      ipTagEl.style.background = ipBg || '';
-      ipTagEl.style.boxShadow = ipOuter ? `0 6px 14px ${ipOuter}` : '';
+      paintDegradedTag(ipTagEl, ipColor);
       ipTagEl.setAttribute('data-tooltip', degradedState.ip.qualityTooltip || t('monitorIpTip'));
       if (ipTagEl.dataset.bound !== '1') {
         ipTagEl.dataset.bound = '1';
@@ -7046,7 +7284,7 @@
     }
     if (powTagEl) {
       powTagEl.textContent = powLabel;
-      powTagEl.style.color = powColor;
+      paintDegradedTag(powTagEl, powColor);
       powTagEl.setAttribute('data-tooltip', t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
     }
     if (powBarEl) {
@@ -7058,7 +7296,7 @@
     const topIp = root.querySelector('#' + TOP_IP_TAG_ID);
     const topPow = root.querySelector('#' + TOP_POW_TAG_ID);
     const powMiniText = powAvailable ? powLabel : t('monitorPowWaiting');
-    paintMiniItem(topSvc, formatMiniLabel('service', serviceTag), serviceFresh ? serviceInfo.color : '#9ca3af', serviceTip);
+    paintMiniItem(topSvc, formatMiniLabel('service', serviceTag), serviceColor, serviceTip);
     paintMiniItem(topIp, formatMiniLabel('ip', ipMiniLabel), ipColor, ipTip);
     paintMiniItem(topPow, formatMiniLabel('pow', powMiniText), powColor, t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
 
@@ -7183,8 +7421,6 @@
     }
 
     const gate = getOptimizeGateStatus(now, turns, domNodes, usedMB);
-    const standby = virtualizationEnabled && !gate.ready;
-    const standbyShort = standby ? t('optimizeBelowThreshold') : '';
 
     if (optimizeGateReady == null) {
       optimizeGateReady = gate.ready;
@@ -7267,6 +7503,7 @@
       else if (worst === 'warn') statusPill.classList.add('warn');
       else if (worst === 'off') statusPill.classList.add('off');
       else statusPill.classList.add('ok');
+      paintMiniItem(statusPill, null, statusColor);
     }
 
     const statusMain = root.querySelector('[data-k="statusMain"]');
@@ -7296,29 +7533,101 @@
       const el = root.querySelector(`[data-k="${k}"]`);
       if (el) el.textContent = v;
     };
+    const escapeHtml = (value) => String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+    const setValueWithTag = (k, valueText, tagText, tagClass, groupClass) => {
+      const el = root.querySelector(`[data-k="${k}"]`);
+      if (!el) return;
+      if (!tagText) {
+        el.textContent = valueText;
+        return;
+      }
+      const safeValue = escapeHtml(valueText);
+      const safeTag = escapeHtml(tagText);
+      const cls = tagClass ? ` ${tagClass}` : '';
+      const groupCls = groupClass ? ` ${groupClass}` : '';
+      el.innerHTML = `<span class="cgpt-vs-valueGroup${groupCls}"><span class="cgpt-vs-tag${cls}">${safeTag}</span><span class="cgpt-vs-valueText">${safeValue}</span></span>`;
+    };
+    const splitParenLabel = (raw) => {
+      const text = String(raw || '').trim();
+      const m = text.match(/^(.*?)[(（]\s*([^()（）]+?)\s*[)）]\s*$/);
+      if (!m) return { value: text, tag: '' };
+      return { value: m[1].trim(), tag: m[2].trim() };
+    };
 
     const softScreens = plan.soft;
     const hardScreens = plan.hard;
     const showPlan = Number.isFinite(softScreens) && Number.isFinite(hardScreens);
     const uiState = formatUIState({ mode: currentMode, dom: domNodes });
     const modeText = uiState.modeLabel;
-    const planSuffix = standbyShort ? (lang === 'zh' ? `（${standbyShort}）` : ` (${standbyShort})`) : '';
     const planText = showPlan
       ? (lang === 'zh'
-        ? `硬×${hardScreens}屏 / 软×${softScreens}屏${planSuffix}`
-        : `Hard ×${hardScreens} / Soft ×${softScreens}${planSuffix}`)
+        ? `硬×${hardScreens}屏/软×${softScreens}屏`
+        : `Hard ×${hardScreens} / Soft ×${softScreens}`)
       : '--';
     setText('mode', modeText);
-    setText('plan', planText);
+    const gateTag = (virtualizationEnabled && showPlan)
+      ? (gate.ready ? t('optimizeReachedThreshold') : t('optimizeBelowThreshold'))
+      : '';
+    if (gateTag && showPlan) setValueWithTag('plan', planText, gateTag, gate.ready ? 'ok' : 'warn');
+    else setText('plan', planText);
+    const planEl = root.querySelector('[data-k="plan"]');
+    if (planEl && showPlan) {
+      const desiredSoft = Number.isFinite(plan.desiredSoft) ? plan.desiredSoft : softScreens;
+      const desiredHard = Number.isFinite(plan.desiredHard) ? plan.desiredHard : hardScreens;
+      const nextStep = getNextMarginStep(turns);
+      const nextPlan = (nextStep != null) ? planMarginsDP(nextStep, currentMode, null) : null;
+      const overrideActive = plan.overrideUntil && now < plan.overrideUntil;
+      const overrideRemaining = overrideActive ? formatDurationMs(Math.max(0, plan.overrideUntil - now)) : '';
+      const lines = [];
+      if (lang === 'zh') {
+        lines.push(`当前轮次: ${turns}`);
+        lines.push(`目标: 软${desiredSoft} / 硬${desiredHard}`);
+        lines.push(`生效: 软${softScreens} / 硬${hardScreens}`);
+        if (nextPlan && Number.isFinite(nextPlan.desiredSoft) && Number.isFinite(nextPlan.desiredHard)) {
+          lines.push(`下一档: ${nextStep}轮 -> 软${nextPlan.desiredSoft} / 硬${nextPlan.desiredHard}`);
+        }
+        if (overrideActive) {
+          lines.push(`临时覆盖: ${plan.overrideReason || 'optimize'}（剩余 ${overrideRemaining}）`);
+        }
+      }
+      else {
+        lines.push(`Turns: ${turns}`);
+        lines.push(`Target: Soft ${desiredSoft} / Hard ${desiredHard}`);
+        lines.push(`Active: Soft ${softScreens} / Hard ${hardScreens}`);
+        if (nextPlan && Number.isFinite(nextPlan.desiredSoft) && Number.isFinite(nextPlan.desiredHard)) {
+          lines.push(`Next: ${nextStep} turns -> Soft ${nextPlan.desiredSoft} / Hard ${nextPlan.desiredHard}`);
+        }
+        if (overrideActive) {
+          lines.push(`Override: ${plan.overrideReason || 'optimize'} (${overrideRemaining} left)`);
+        }
+      }
+      planEl.setAttribute('data-tooltip', lines.join('\n'));
+    }
+    else if (planEl) {
+      planEl.removeAttribute('data-tooltip');
+    }
     setText('dom', domInfo.label);
 
     const memEl = root.querySelector(`[data-k="mem"]`);
     if (memEl) {
-      memEl.textContent = memInfo.label;
       memEl.classList.remove('mem-ok', 'mem-warn', 'mem-bad');
-      if (memInfo.level === 'ok') memEl.classList.add('mem-ok');
-      if (memInfo.level === 'warn') memEl.classList.add('mem-warn');
-      if (memInfo.level === 'bad') memEl.classList.add('mem-bad');
+      const memParts = splitParenLabel(memInfo.label);
+      const memClass =
+        memInfo.level === 'ok' ? 'ok mem-ok' :
+        memInfo.level === 'warn' ? 'warn mem-warn' :
+        memInfo.level === 'bad' ? 'bad mem-bad' : '';
+      if (memParts.tag) {
+        setValueWithTag('mem', memParts.value, memParts.tag, memClass, 'tight');
+      }
+      else {
+        memEl.textContent = memInfo.label;
+        if (memClass) memEl.classList.add(memClass);
+      }
     }
 
     setText('turns', `${turns}`);
@@ -7379,56 +7688,34 @@
 
     const pauseTag = root.querySelector('#' + TOP_PAUSE_TAG_ID);
     if (pauseTag) {
-      const pauseText = pauseTag.querySelector('.cgpt-vs-miniText');
-      const pauseDot = pauseTag.querySelector('.cgpt-vs-miniDot');
       if (paused) {
         const label = pauseReasonLabel(displayPauseReason) || t('statePaused');
-        if (pauseText) pauseText.textContent = label;
         pauseTag.style.display = '';
         pauseTag.classList.add('pause');
-        pauseTag.setAttribute('data-tooltip', pauseReasonText(displayPauseReason));
-        if (pauseDot) {
-          pauseDot.style.background = '#f59e0b';
-          pauseDot.style.boxShadow = '0 0 0 2px rgba(245,158,11,0.2)';
-        }
+        paintMiniItem(pauseTag, label, '#f59e0b', pauseReasonText(displayPauseReason));
       }
       else {
         pauseTag.style.display = 'none';
         pauseTag.classList.remove('pause');
         pauseTag.removeAttribute('data-tooltip');
-        if (pauseDot) {
-          pauseDot.style.background = '';
-          pauseDot.style.boxShadow = '';
-        }
+        paintMiniItem(pauseTag, null, null, null);
       }
     }
 
     const optTag = root.querySelector('#' + TOP_OPT_TAG_ID);
     if (optTag) {
-      const optText = optTag.querySelector('.cgpt-vs-miniText');
-      const optDot = optTag.querySelector('.cgpt-vs-miniDot');
       const optimizing = isOptimizingNow();
       const yielding = pausedByChat;
       const label = yielding
         ? (lang === 'zh' ? '避让中' : 'Yielding')
         : (optimizing ? (lang === 'zh' ? '优化中' : 'Optimizing') : (lang === 'zh' ? '空闲' : 'Idle'));
       const color = yielding ? '#f59e0b' : (optimizing ? '#3b82f6' : '#9ca3af');
-      if (optText) optText.textContent = formatMiniLabel('opt', label);
       optTag.classList.toggle('optimizing', optimizing && !yielding);
       optTag.classList.toggle('pause', yielding);
-      optTag.setAttribute('data-tooltip', yielding
+      const optTip = yielding
         ? (lang === 'zh' ? '回复生成中，优化已避让' : 'Assistant replying: optimization yields temporarily')
-        : (optimizing ? (lang === 'zh' ? '正在优化渲染负载' : 'Optimization in progress') : (lang === 'zh' ? '未进行优化' : 'No optimization running')));
-      if (optDot) {
-        optDot.style.background = color;
-        optDot.style.boxShadow = yielding
-          ? '0 0 0 2px rgba(245,158,11,0.2)'
-          : (optimizing ? '0 0 0 2px rgba(59,130,246,0.2)' : '0 0 0 2px rgba(156,163,175,0.2)');
-      }
-      optTag.style.borderColor = '';
-      optTag.style.background = '';
-      optTag.style.boxShadow = '';
-      optTag.style.color = yielding ? '' : (optimizing ? '#1d4ed8' : '');
+        : (optimizing ? (lang === 'zh' ? '正在优化渲染负载' : 'Optimization in progress') : (lang === 'zh' ? '未进行优化' : 'No optimization running'));
+      paintMiniItem(optTag, formatMiniLabel('opt', label), color, optTip);
     }
 
     placeMoodSection();
