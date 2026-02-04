@@ -19,6 +19,61 @@
 // @noframes
 // ==/UserScript==
 
+const __CGPT_BROWSER__ = typeof window !== 'undefined' && typeof document !== 'undefined';
+
+function evaluateIdleGate({
+  now = Date.now(),
+  chatBusy = false,
+  inputBusy = false,
+  scrollBusy = false,
+  deferSince = 0,
+  maintenanceAt = 0,
+  maxDeferMs = 0,
+  maintenanceCooldownMs = 0
+} = {}) {
+  const chatBlocked = !!chatBusy;
+  const inputBlocked = !!inputBusy;
+  const scrollBlocked = !!scrollBusy;
+  const blocked = chatBlocked || inputBlocked || scrollBlocked;
+
+  let nextDeferSince = deferSince || 0;
+  let nextMaintenanceAt = maintenanceAt || 0;
+
+  if (blocked) {
+    if (!nextDeferSince) nextDeferSince = now;
+  }
+  else {
+    nextDeferSince = 0;
+  }
+
+  let allowMaintenance = false;
+  if (blocked && !chatBlocked) {
+    const deferredFor = nextDeferSince ? (now - nextDeferSince) : 0;
+    const cooldownOk = !nextMaintenanceAt || (now - nextMaintenanceAt >= maintenanceCooldownMs);
+    if (nextDeferSince && deferredFor >= maxDeferMs && cooldownOk) {
+      allowMaintenance = true;
+      nextMaintenanceAt = now;
+    }
+  }
+
+  return {
+    blocked,
+    chatBlocked,
+    inputBlocked,
+    scrollBlocked,
+    allowMaintenance,
+    deferSince: nextDeferSince,
+    maintenanceAt: nextMaintenanceAt
+  };
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    evaluateIdleGate
+  };
+}
+
+if (__CGPT_BROWSER__) {
 (function () {
   'use strict';
 
@@ -7853,4 +7908,5 @@
   setTimeout(safeBoot, 900);
   // endregion: Route Guards & Boot
 })();
+}
 
