@@ -152,6 +152,9 @@ if (__CGPT_BROWSER__) {
   const OPTIMIZE_IDLE_CLEAR_MS = 2000;
   const HARD_SCROLL_IDLE_MS = 160;
   const HARD_SCROLL_MAX_DEFER_MS = 1200;
+  const IDLE_OPTIMIZE_SCROLL_IDLE_MS = 240;
+  const IDLE_OPTIMIZE_MAX_DEFER_MS = 8000;
+  const IDLE_OPTIMIZE_MAINTENANCE_COOLDOWN_MS = 2000;
   const SOFT_SYNC_DEBOUNCE_MS = 160;
   const SOFT_SYNC_CHAT_DEBOUNCE_MS = 520;
   const UI_FULL_REFRESH_OPEN_MS = 900;
@@ -470,6 +473,8 @@ if (__CGPT_BROWSER__) {
   let virtualizeDeferred = false;
   let virtualizeDeferredTimer = 0;
   let pendingVirtualizeMargin = null;
+  let idleDeferSince = 0;
+  let idleMaintenanceAt = 0;
 
   let followTimer = null;
   let docClickHandler = null;
@@ -1596,6 +1601,31 @@ if (__CGPT_BROWSER__) {
   function shouldYieldToInput(now) {
     const t = Number.isFinite(now) ? now : Date.now();
     return !!inputYieldUntil && t < inputYieldUntil;
+  }
+
+  function getIdleGateState(now) {
+    const t = Number.isFinite(now) ? now : Date.now();
+    const chatBusyNow = autoPauseOnChat && updateChatBusy(false);
+    const inputBusy = shouldYieldToInput(t);
+    const scrollBusy = !!lastScrollAt && (t - lastScrollAt) < IDLE_OPTIMIZE_SCROLL_IDLE_MS;
+    const result = evaluateIdleGate({
+      now: t,
+      chatBusy: chatBusyNow,
+      inputBusy,
+      scrollBusy,
+      deferSince: idleDeferSince,
+      maintenanceAt: idleMaintenanceAt,
+      maxDeferMs: IDLE_OPTIMIZE_MAX_DEFER_MS,
+      maintenanceCooldownMs: IDLE_OPTIMIZE_MAINTENANCE_COOLDOWN_MS
+    });
+    idleDeferSince = result.deferSince;
+    idleMaintenanceAt = result.maintenanceAt;
+    return {
+      ...result,
+      chatBusy: chatBusyNow,
+      inputBusy,
+      scrollBusy
+    };
   }
 
   function scheduleDeferredVirtualize(delayMs) {
@@ -3876,10 +3906,18 @@ if (__CGPT_BROWSER__) {
   function syncSoftNodes(reason) {
     if (!useSoftVirtualization) return;
 
-    const busy = autoPauseOnChat && updateChatBusy(false);
-    if (busy) {
+    const now = Date.now();
+    const idleState = getIdleGateState(now);
+    const maintenanceOk = idleState.allowMaintenance || (reason === 'idle.maintenance' && !idleState.chatBlocked);
+    if (idleState.blocked && !maintenanceOk) {
       softSyncDeferred = true;
       setOptimizeActive(false);
+      if (!idleState.chatBlocked) {
+        const delayHint = idleState.inputBlocked && inputYieldUntil
+          ? (inputYieldUntil - now) + 20
+          : IDLE_OPTIMIZE_SCROLL_IDLE_MS;
+        scheduleDeferredVirtualize(delayHint);
+      }
       return;
     }
 
@@ -4943,17 +4981,24 @@ if (__CGPT_BROWSER__) {
 
   function scheduleVirtualize(marginOverride) {
     const now = Date.now();
-    const pausedByChat = autoPauseOnChat && chatBusy;
-    if (pausedByChat) {
+    const idleState = getIdleGateState(now);
+    if (idleState.blocked) {
       virtualizeDeferred = true;
       if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
+      if (idleState.allowMaintenance) {
+        scheduleSoftSync('idle.maintenance');
+      }
+      if (!idleState.chatBlocked) {
+        const delayHint = idleState.inputBlocked && inputYieldUntil
+          ? (inputYieldUntil - now) + 20
+          : IDLE_OPTIMIZE_SCROLL_IDLE_MS;
+        scheduleDeferredVirtualize(delayHint);
+      }
       return;
     }
-    if (shouldYieldToInput(now)) {
-      virtualizeDeferred = true;
-      if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
-      scheduleDeferredVirtualize((inputYieldUntil - now) + 20);
-      return;
+    if (softSyncDeferred) {
+      softSyncDeferred = false;
+      scheduleSoftSync('idle.resume');
     }
     if (rafPending) return;
     rafPending = true;
