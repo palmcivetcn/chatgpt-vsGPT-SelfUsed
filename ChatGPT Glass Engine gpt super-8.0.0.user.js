@@ -39,21 +39,18 @@ function evaluateIdleGate({
   let nextDeferSince = deferSince || 0;
   let nextMaintenanceAt = maintenanceAt || 0;
 
+  let allowMaintenance = false;
   if (blocked) {
     if (!nextDeferSince) nextDeferSince = now;
   }
   else {
-    nextDeferSince = 0;
-  }
-
-  let allowMaintenance = false;
-  if (blocked && !chatBlocked) {
     const deferredFor = nextDeferSince ? (now - nextDeferSince) : 0;
     const cooldownOk = !nextMaintenanceAt || (now - nextMaintenanceAt >= maintenanceCooldownMs);
     if (nextDeferSince && deferredFor >= maxDeferMs && cooldownOk) {
       allowMaintenance = true;
       nextMaintenanceAt = now;
     }
+    nextDeferSince = 0;
   }
 
   return {
