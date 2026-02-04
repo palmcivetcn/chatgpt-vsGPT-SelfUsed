@@ -58,6 +58,7 @@
   const CHECK_INTERVAL_MS = 1500;
   const ROUTE_GUARD_MS = 1200;
   const INPUT_DIM_IDLE_MS = 850;
+  const INPUT_OPTIMIZE_GRACE_MS = 680;
   const IMAGE_LOAD_RETRY_MS = 250;
   const POS_FOLLOW_MS = 450;
   const POS_FOLLOW_WHEN_OPEN_MS = 250;
@@ -108,6 +109,23 @@
   const OPTIMIZE_PRESSURE_MED = 0.6;
   const OPTIMIZE_PRESSURE_HIGH = 0.85;
   const OPTIMIZE_PRESSURE_CRITICAL = 1.05;
+  const DEFAULT_PRESSURE_THRESHOLDS = {
+    medium: OPTIMIZE_PRESSURE_MED,
+    high: OPTIMIZE_PRESSURE_HIGH,
+    critical: OPTIMIZE_PRESSURE_CRITICAL
+  };
+  const DEFAULT_OPTIMIZE_DELTA_BY_LEVEL = {
+    low: 0,
+    medium: 0,
+    high: -1,
+    critical: -2
+  };
+  const PRESSURE_LEVEL_ORDER = {
+    low: 0,
+    medium: 1,
+    high: 2,
+    critical: 3
+  };
 
   const MODE_MARGIN_LIMITS = {
     performance: { minSoft: 1, minHard: 2, maxSoft: 2, maxHard: 4 },
@@ -151,6 +169,35 @@
   const AUTO_HARD_EXIT_MS = 4500;
   const AUTO_HARD_TURN_STEPS = [80, 160, 240, 320];
   const AUTO_HARD_TURN_FACTORS = [1.08, 1.0, 0.95, 0.9, 0.85];
+  const MODE_OPTIMIZE_PROFILES = {
+    performance: {
+      pressure: { medium: 0.55, high: 0.8, critical: 0.98 },
+      deltaByPressure: { low: 0, medium: -1, high: -2, critical: -3 },
+      autoOptimizeMinTurns: 60,
+      autoHardFactor: 0.85,
+      autoHardExitFactor: 0.55,
+      hardPressureLevel: 'medium',
+      gatePressureLevel: 'medium'
+    },
+    balanced: {
+      pressure: DEFAULT_PRESSURE_THRESHOLDS,
+      deltaByPressure: DEFAULT_OPTIMIZE_DELTA_BY_LEVEL,
+      autoOptimizeMinTurns: AUTO_OPTIMIZE_MIN_TURNS,
+      autoHardFactor: 1.0,
+      autoHardExitFactor: 0.6,
+      hardPressureLevel: 'high',
+      gatePressureLevel: 'high'
+    },
+    conservative: {
+      pressure: { medium: 0.7, high: 0.98, critical: 1.15 },
+      deltaByPressure: { low: 0, medium: 0, high: -1, critical: -1 },
+      autoOptimizeMinTurns: 110,
+      autoHardFactor: 1.12,
+      autoHardExitFactor: 0.7,
+      hardPressureLevel: 'critical',
+      gatePressureLevel: 'critical'
+    }
+  };
 
   // ========================== 服务降级监控常量 ==========================
   const DEG_STATUS_REFRESH_MS = 2 * 60 * 1000;
@@ -358,10 +405,14 @@
   let ctrlFFreeze = false;
   let typingDimTimer = null;
   let lastInputAt = 0;
+  let inputYieldUntil = 0;
 
   let rafPending = false;
   let lastVirtualizedCount = 0;
   let lastTurnsCount = 0;
+  let virtualizeDeferred = false;
+  let virtualizeDeferredTimer = 0;
+  let pendingVirtualizeMargin = null;
 
   let followTimer = null;
   let docClickHandler = null;
@@ -502,6 +553,694 @@
   // endregion: Runtime State
 
   // region: Logging & Diagnostics
+  // region: Pino (browser bundle)
+  /* eslint-disable */
+  /*
+  * Pino v10.3.0 (MIT License)
+  * The MIT License (MIT)
+  * 
+  * Copyright (c) 2016-2025 Matteo Collina, David Mark Clements and the Pino contributors listed at <https://github.com/pinojs/pino#the-team> and in the README file.
+  * 
+  * Permission is hereby granted, free of charge, to any person obtaining a copy
+  * of this software and associated documentation files (the "Software"), to deal
+  * in the Software without restriction, including without limitation the rights
+  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  * copies of the Software, and to permit persons to whom the Software is
+  * furnished to do so, subject to the following conditions:
+  * 
+  * The above copyright notice and this permission notice shall be included in all
+  * copies or substantial portions of the Software.
+  * 
+  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  * SOFTWARE.
+  * 
+  * 
+  */
+  const pino = (() => {
+    'use strict';
+    const format = (() => {
+      function tryStringify (o) {
+        try { return JSON.stringify(o) } catch(e) { return '"[Circular]"' }
+      }
+
+      function format(f, args, opts) {
+        var ss = (opts && opts.stringify) || tryStringify
+        var offset = 1
+        if (typeof f === 'object' && f !== null) {
+          var len = args.length + offset
+          if (len === 1) return f
+          var objects = new Array(len)
+          objects[0] = ss(f)
+          for (var index = 1; index < len; index++) {
+            objects[index] = ss(args[index])
+          }
+          return objects.join(' ')
+        }
+        if (typeof f !== 'string') {
+          return f
+        }
+        var argLen = args.length
+        if (argLen === 0) return f
+        var str = ''
+        var a = 1 - offset
+        var lastPos = -1
+        var flen = (f && f.length) || 0
+        for (var i = 0; i < flen;) {
+          if (f.charCodeAt(i) === 37 && i + 1 < flen) {
+            lastPos = lastPos > -1 ? lastPos : 0
+            switch (f.charCodeAt(i + 1)) {
+              case 100: // 'd'
+              case 102: // 'f'
+                if (a >= argLen)
+                  break
+                if (lastPos < i)
+                  str += f.slice(lastPos, i)
+                if (args[a] == null)  break
+                str += Number(args[a])
+                lastPos = i = i + 2
+                break
+              case 105: // 'i'
+                if (a >= argLen)
+                  break
+                if (lastPos < i)
+                  str += f.slice(lastPos, i)
+                if (args[a] == null)  break
+                str += Math.floor(Number(args[a]))
+                lastPos = i = i + 2
+                break
+              case 79: // 'O'
+              case 111: // 'o'
+              case 106: // 'j'
+                if (a >= argLen)
+                  break
+                if (lastPos < i)
+                  str += f.slice(lastPos, i)
+                if (args[a] === undefined) break
+                var type = typeof args[a]
+                if (type === 'string') {
+                  str += '\'' + args[a] + '\''
+                  lastPos = i + 2
+                  i++
+                  break
+                }
+                if (type === 'function') {
+                  str += args[a].name || '<anonymous>'
+                  lastPos = i + 2
+                  i++
+                  break
+                }
+                str += ss(args[a])
+                lastPos = i + 2
+                i++
+                break
+              case 115: // 's'
+                if (a >= argLen)
+                  break
+                if (lastPos < i)
+                  str += f.slice(lastPos, i)
+                str += String(args[a])
+                lastPos = i + 2
+                i++
+                break
+              case 37: // '%'
+                if (lastPos < i)
+                  str += f.slice(lastPos, i)
+                str += '%'
+                lastPos = i + 2
+                i++
+                a--
+                break
+            }
+            ++a
+          }
+          ++i
+        }
+        if (lastPos === -1)
+          return f
+        else if (lastPos < flen) {
+          str += f.slice(lastPos)
+        }
+
+        return str
+      }
+
+      return format;
+    })();
+
+      const _console = pfGlobalThisOrFallback().console || {}
+      const stdSerializers = {
+        mapHttpRequest: mock,
+        mapHttpResponse: mock,
+        wrapRequestSerializer: passthrough,
+        wrapResponseSerializer: passthrough,
+        wrapErrorSerializer: passthrough,
+        req: mock,
+        res: mock,
+        err: asErrValue,
+        errWithCause: asErrValue
+      }
+      function levelToValue (level, logger) {
+        return level === 'silent'
+          ? Infinity
+          : logger.levels.values[level]
+      }
+      const baseLogFunctionSymbol = Symbol('pino.logFuncs')
+      const hierarchySymbol = Symbol('pino.hierarchy')
+
+      const logFallbackMap = {
+        error: 'log',
+        fatal: 'error',
+        warn: 'error',
+        info: 'log',
+        debug: 'log',
+        trace: 'log'
+      }
+
+      function appendChildLogger (parentLogger, childLogger) {
+        const newEntry = {
+          logger: childLogger,
+          parent: parentLogger[hierarchySymbol]
+        }
+        childLogger[hierarchySymbol] = newEntry
+      }
+
+      function setupBaseLogFunctions (logger, levels, proto) {
+        const logFunctions = {}
+        levels.forEach(level => {
+          logFunctions[level] = proto[level] ? proto[level] : (_console[level] || _console[logFallbackMap[level] || 'log'] || noop)
+        })
+        logger[baseLogFunctionSymbol] = logFunctions
+      }
+
+      function shouldSerialize (serialize, serializers) {
+        if (Array.isArray(serialize)) {
+          const hasToFilter = serialize.filter(function (k) {
+            return k !== '!stdSerializers.err'
+          })
+          return hasToFilter
+        } else if (serialize === true) {
+          return Object.keys(serializers)
+        }
+
+        return false
+      }
+
+      function pino (opts) {
+        opts = opts || {}
+        opts.browser = opts.browser || {}
+
+        const transmit = opts.browser.transmit
+        if (transmit && typeof transmit.send !== 'function') { throw Error('pino: transmit option must have a send function') }
+
+        const proto = opts.browser.write || _console
+        if (opts.browser.write) opts.browser.asObject = true
+        const serializers = opts.serializers || {}
+        const serialize = shouldSerialize(opts.browser.serialize, serializers)
+        let stdErrSerialize = opts.browser.serialize
+
+        if (
+          Array.isArray(opts.browser.serialize) &&
+          opts.browser.serialize.indexOf('!stdSerializers.err') > -1
+        ) stdErrSerialize = false
+
+        const customLevels = Object.keys(opts.customLevels || {})
+        const levels = ['error', 'fatal', 'warn', 'info', 'debug', 'trace'].concat(customLevels)
+
+        if (typeof proto === 'function') {
+          levels.forEach(function (level) {
+            proto[level] = proto
+          })
+        }
+        if (opts.enabled === false || opts.browser.disabled) opts.level = 'silent'
+        const level = opts.level || 'info'
+        const logger = Object.create(proto)
+        if (!logger.log) logger.log = noop
+
+        setupBaseLogFunctions(logger, levels, proto)
+        // setup root hierarchy entry
+        appendChildLogger({}, logger)
+
+        Object.defineProperty(logger, 'levelVal', {
+          get: getLevelVal
+        })
+        Object.defineProperty(logger, 'level', {
+          get: getLevel,
+          set: setLevel
+        })
+
+        const setOpts = {
+          transmit,
+          serialize,
+          asObject: opts.browser.asObject,
+          asObjectBindingsOnly: opts.browser.asObjectBindingsOnly,
+          formatters: opts.browser.formatters,
+          reportCaller: opts.browser.reportCaller,
+          levels,
+          timestamp: getTimeFunction(opts),
+          messageKey: opts.messageKey || 'msg',
+          onChild: opts.onChild || noop
+        }
+        logger.levels = getLevels(opts)
+        logger.level = level
+
+        logger.isLevelEnabled = function (level) {
+          if (!this.levels.values[level]) {
+            return false
+          }
+
+          return this.levels.values[level] >= this.levels.values[this.level]
+        }
+        logger.setMaxListeners = logger.getMaxListeners =
+        logger.emit = logger.addListener = logger.on =
+        logger.prependListener = logger.once =
+        logger.prependOnceListener = logger.removeListener =
+        logger.removeAllListeners = logger.listeners =
+        logger.listenerCount = logger.eventNames =
+        logger.write = logger.flush = noop
+        logger.serializers = serializers
+        logger._serialize = serialize
+        logger._stdErrSerialize = stdErrSerialize
+        logger.child = function (...args) { return child.call(this, setOpts, ...args) }
+
+        if (transmit) logger._logEvent = createLogEventShape()
+
+        function getLevelVal () {
+          return levelToValue(this.level, this)
+        }
+
+        function getLevel () {
+          return this._level
+        }
+        function setLevel (level) {
+          if (level !== 'silent' && !this.levels.values[level]) {
+            throw Error('unknown level ' + level)
+          }
+          this._level = level
+
+          set(this, setOpts, logger, 'error') // <-- must stay first
+          set(this, setOpts, logger, 'fatal')
+          set(this, setOpts, logger, 'warn')
+          set(this, setOpts, logger, 'info')
+          set(this, setOpts, logger, 'debug')
+          set(this, setOpts, logger, 'trace')
+
+          customLevels.forEach((level) => {
+            set(this, setOpts, logger, level)
+          })
+        }
+
+        function child (setOpts, bindings, childOptions) {
+          if (!bindings) {
+            throw new Error('missing bindings for child Pino')
+          }
+          childOptions = childOptions || {}
+          if (serialize && bindings.serializers) {
+            childOptions.serializers = bindings.serializers
+          }
+          const childOptionsSerializers = childOptions.serializers
+          if (serialize && childOptionsSerializers) {
+            var childSerializers = Object.assign({}, serializers, childOptionsSerializers)
+            var childSerialize = opts.browser.serialize === true
+              ? Object.keys(childSerializers)
+              : serialize
+            delete bindings.serializers
+            applySerializers([bindings], childSerialize, childSerializers, this._stdErrSerialize)
+          }
+          function Child (parent) {
+            this._childLevel = (parent._childLevel | 0) + 1
+
+            // make sure bindings are available in the `set` function
+            this.bindings = bindings
+
+            if (childSerializers) {
+              this.serializers = childSerializers
+              this._serialize = childSerialize
+            }
+            if (transmit) {
+              this._logEvent = createLogEventShape(
+                [].concat(parent._logEvent.bindings, bindings)
+              )
+            }
+          }
+          Child.prototype = this
+          const newLogger = new Child(this)
+
+          // must happen before the level is assigned
+          appendChildLogger(this, newLogger)
+          newLogger.child = function (...args) { return child.call(this, setOpts, ...args) }
+          // required to actually initialize the logger functions for any given child
+          newLogger.level = childOptions.level || this.level // allow level to be set by childOptions
+          setOpts.onChild(newLogger)
+
+          return newLogger
+        }
+        return logger
+      }
+
+      function getLevels (opts) {
+        const customLevels = opts.customLevels || {}
+
+        const values = Object.assign({}, pino.levels.values, customLevels)
+        const labels = Object.assign({}, pino.levels.labels, invertObject(customLevels))
+
+        return {
+          values,
+          labels
+        }
+      }
+
+      function invertObject (obj) {
+        const inverted = {}
+        Object.keys(obj).forEach(function (key) {
+          inverted[obj[key]] = key
+        })
+        return inverted
+      }
+
+      pino.levels = {
+        values: {
+          fatal: 60,
+          error: 50,
+          warn: 40,
+          info: 30,
+          debug: 20,
+          trace: 10
+        },
+        labels: {
+          10: 'trace',
+          20: 'debug',
+          30: 'info',
+          40: 'warn',
+          50: 'error',
+          60: 'fatal'
+        }
+      }
+
+      pino.stdSerializers = stdSerializers
+      pino.stdTimeFunctions = Object.assign({}, { nullTime, epochTime, unixTime, isoTime })
+
+      function getBindingChain (logger) {
+        const bindings = []
+        if (logger.bindings) {
+          bindings.push(logger.bindings)
+        }
+
+        // traverse up the tree to get all bindings
+        let hierarchy = logger[hierarchySymbol]
+        while (hierarchy.parent) {
+          hierarchy = hierarchy.parent
+          if (hierarchy.logger.bindings) {
+            bindings.push(hierarchy.logger.bindings)
+          }
+        }
+
+        return bindings.reverse()
+      }
+
+      function set (self, opts, rootLogger, level) {
+        // override the current log functions with either `noop` or the base log function
+        Object.defineProperty(self, level, {
+          value: (levelToValue(self.level, rootLogger) > levelToValue(level, rootLogger)
+            ? noop
+            : rootLogger[baseLogFunctionSymbol][level]),
+          writable: true,
+          enumerable: true,
+          configurable: true
+        })
+
+        if (self[level] === noop) {
+          if (!opts.transmit) return
+
+          const transmitLevel = opts.transmit.level || self.level
+          const transmitValue = levelToValue(transmitLevel, rootLogger)
+          const methodValue = levelToValue(level, rootLogger)
+          if (methodValue < transmitValue) return
+        }
+
+        // make sure the log format is correct
+        self[level] = createWrap(self, opts, rootLogger, level)
+
+        // prepend bindings if it is not the root logger
+        const bindings = getBindingChain(self)
+        if (bindings.length === 0) {
+          // early exit in case for rootLogger
+          return
+        }
+        self[level] = prependBindingsInArguments(bindings, self[level])
+      }
+
+      function prependBindingsInArguments (bindings, logFunc) {
+        return function () {
+          return logFunc.apply(this, [...bindings, ...arguments])
+        }
+      }
+
+      function createWrap (self, opts, rootLogger, level) {
+        return (function (write) {
+          return function LOG () {
+            const ts = opts.timestamp()
+            const args = new Array(arguments.length)
+            const proto = (Object.getPrototypeOf && Object.getPrototypeOf(this) === _console) ? _console : this
+            for (var i = 0; i < args.length; i++) args[i] = arguments[i]
+
+            var argsIsSerialized = false
+            if (opts.serialize) {
+              applySerializers(args, this._serialize, this.serializers, this._stdErrSerialize)
+              argsIsSerialized = true
+            }
+            if (opts.asObject || opts.formatters) {
+              const out = asObject(this, level, args, ts, opts)
+              if (opts.reportCaller && out && out.length > 0 && out[0] && typeof out[0] === 'object') {
+                try {
+                  const caller = getCallerLocation()
+                  if (caller) out[0].caller = caller
+                } catch (e) {}
+              }
+              write.call(proto, ...out)
+            } else {
+              if (opts.reportCaller) {
+                try {
+                  const caller = getCallerLocation()
+                  if (caller) args.push(caller)
+                } catch (e) {}
+              }
+              write.apply(proto, args)
+            }
+
+            if (opts.transmit) {
+              const transmitLevel = opts.transmit.level || self._level
+              const transmitValue = levelToValue(transmitLevel, rootLogger)
+              const methodValue = levelToValue(level, rootLogger)
+              if (methodValue < transmitValue) return
+              transmit(this, {
+                ts,
+                methodLevel: level,
+                methodValue,
+                transmitLevel,
+                transmitValue: rootLogger.levels.values[opts.transmit.level || self._level],
+                send: opts.transmit.send,
+                val: levelToValue(self._level, rootLogger)
+              }, args, argsIsSerialized)
+            }
+          }
+        })(self[baseLogFunctionSymbol][level])
+      }
+
+      function asObject (logger, level, args, ts, opts) {
+        const {
+          level: levelFormatter,
+          log: logObjectFormatter = (obj) => obj
+        } = opts.formatters || {}
+        const argsCloned = args.slice()
+        let msg = argsCloned[0]
+        const logObject = {}
+
+        let lvl = (logger._childLevel | 0) + 1
+        if (lvl < 1) lvl = 1
+
+        if (ts) {
+          logObject.time = ts
+        }
+
+        if (levelFormatter) {
+          const formattedLevel = levelFormatter(level, logger.levels.values[level])
+          Object.assign(logObject, formattedLevel)
+        } else {
+          logObject.level = logger.levels.values[level]
+        }
+
+        if (opts.asObjectBindingsOnly) {
+          if (msg !== null && typeof msg === 'object') {
+            while (lvl-- && typeof argsCloned[0] === 'object') {
+              Object.assign(logObject, argsCloned.shift())
+            }
+          }
+
+          const formattedLogObject = logObjectFormatter(logObject)
+          return [formattedLogObject, ...argsCloned]
+        } else {
+          // deliberate, catching objects, arrays
+          if (msg !== null && typeof msg === 'object') {
+            while (lvl-- && typeof argsCloned[0] === 'object') {
+              Object.assign(logObject, argsCloned.shift())
+            }
+            msg = argsCloned.length ? format(argsCloned.shift(), argsCloned) : undefined
+          } else if (typeof msg === 'string') msg = format(argsCloned.shift(), argsCloned)
+          if (msg !== undefined) logObject[opts.messageKey] = msg
+
+          const formattedLogObject = logObjectFormatter(logObject)
+          return [formattedLogObject]
+        }
+      }
+
+      function applySerializers (args, serialize, serializers, stdErrSerialize) {
+        for (const i in args) {
+          if (stdErrSerialize && args[i] instanceof Error) {
+            args[i] = pino.stdSerializers.err(args[i])
+          } else if (typeof args[i] === 'object' && !Array.isArray(args[i]) && serialize) {
+            for (const k in args[i]) {
+              if (serialize.indexOf(k) > -1 && k in serializers) {
+                args[i][k] = serializers[k](args[i][k])
+              }
+            }
+          }
+        }
+      }
+
+      function transmit (logger, opts, args, argsIsSerialized = false) {
+        const send = opts.send
+        const ts = opts.ts
+        const methodLevel = opts.methodLevel
+        const methodValue = opts.methodValue
+        const val = opts.val
+        const bindings = logger._logEvent.bindings
+
+        if (!argsIsSerialized) {
+          applySerializers(
+            args,
+            logger._serialize || Object.keys(logger.serializers),
+            logger.serializers,
+            logger._stdErrSerialize === undefined ? true : logger._stdErrSerialize
+          )
+        }
+
+        logger._logEvent.ts = ts
+        logger._logEvent.messages = args.filter(function (arg) {
+          // bindings can only be objects, so reference equality check via indexOf is fine
+          return bindings.indexOf(arg) === -1
+        })
+
+        logger._logEvent.level.label = methodLevel
+        logger._logEvent.level.value = methodValue
+
+        send(methodLevel, logger._logEvent, val)
+
+        logger._logEvent = createLogEventShape(bindings)
+      }
+
+      function createLogEventShape (bindings) {
+        return {
+          ts: 0,
+          messages: [],
+          bindings: bindings || [],
+          level: { label: '', value: 0 }
+        }
+      }
+
+      function asErrValue (err) {
+        const obj = {
+          type: err.constructor.name,
+          msg: err.message,
+          stack: err.stack
+        }
+        for (const key in err) {
+          if (obj[key] === undefined) {
+            obj[key] = err[key]
+          }
+        }
+        return obj
+      }
+
+      function getTimeFunction (opts) {
+        if (typeof opts.timestamp === 'function') {
+          return opts.timestamp
+        }
+        if (opts.timestamp === false) {
+          return nullTime
+        }
+        return epochTime
+      }
+
+      function mock () { return {} }
+      function passthrough (a) { return a }
+      function noop () {}
+
+      function nullTime () { return false }
+      function epochTime () { return Date.now() }
+      function unixTime () { return Math.round(Date.now() / 1000.0) }
+      function isoTime () { return new Date(Date.now()).toISOString() } // using Date.now() for testability
+
+      /* eslint-disable */
+      /* istanbul ignore next */
+      function pfGlobalThisOrFallback () {
+        function defd (o) { return typeof o !== 'undefined' && o }
+        try {
+          if (typeof globalThis !== 'undefined') return globalThis
+          Object.defineProperty(Object.prototype, 'globalThis', {
+            get: function () {
+              delete Object.prototype.globalThis
+              return (this.globalThis = this)
+            },
+            configurable: true
+          })
+          return globalThis
+        } catch (e) {
+          return defd(self) || defd(window) || defd(this) || {}
+        }
+      }
+      /* eslint-enable */
+
+      if (typeof module !== 'undefined' && module && module.exports) {
+        module.exports.default = pino
+        module.exports.pino = pino
+      }
+
+      // Attempt to extract the user callsite (file:line:column)
+      /* istanbul ignore next */
+      function getCallerLocation () {
+        const stack = (new Error()).stack
+        if (!stack) return null
+        const lines = stack.split('\n')
+        for (let i = 1; i < lines.length; i++) {
+          const l = lines[i].trim()
+          // skip frames from this file and internals
+          if (/(^at\s+)?(createWrap|LOG|set\s*\(|asObject|Object\.apply|Function\.apply)/.test(l)) continue
+          if (l.indexOf('browser.js') !== -1) continue
+          if (l.indexOf('node:internal') !== -1) continue
+          if (l.indexOf('node_modules') !== -1) continue
+          // try formats like: at func (file:line:col) or at file:line:col
+          let m = l.match(/\((.*?):(\d+):(\d+)\)/)
+          if (!m) m = l.match(/at\s+(.*?):(\d+):(\d+)/)
+          if (m) {
+            const file = m[1]
+            const line = m[2]
+            const col = m[3]
+            return file + ':' + line + ':' + col
+          }
+        }
+        return null
+      }
+
+    return pino;
+  })();
+  /* eslint-enable */
+  // endregion: Pino (browser bundle)
+
   // ========================== 诊断日志（控制台输出） ==========================
   const LOG_KEY = 'cgpt_vs_log_level';
   const LOG_CONSOLE_KEY = 'cgpt_vs_log_console';
@@ -778,10 +1517,48 @@
           softSyncDeferred = false;
           scheduleSoftSync('chat.resume');
         }
-        scheduleVirtualize();
+        if (virtualizeDeferred) {
+          virtualizeDeferred = false;
+          const pending = pendingVirtualizeMargin;
+          pendingVirtualizeMargin = null;
+          scheduleVirtualize(pending);
+        }
+        else {
+          scheduleVirtualize();
+        }
       }
     }
     return chatBusy;
+  }
+
+  function markInputYield(durationMs) {
+    const now = Date.now();
+    const duration = Number.isFinite(durationMs) ? durationMs : INPUT_OPTIMIZE_GRACE_MS;
+    const next = now + Math.max(0, duration);
+    if (next > inputYieldUntil) inputYieldUntil = next;
+  }
+
+  function shouldYieldToInput(now) {
+    const t = Number.isFinite(now) ? now : Date.now();
+    return !!inputYieldUntil && t < inputYieldUntil;
+  }
+
+  function scheduleDeferredVirtualize(delayMs) {
+    if (virtualizeDeferredTimer) return;
+    const delay = Math.max(60, Math.min(1200, Number(delayMs) || INPUT_OPTIMIZE_GRACE_MS));
+    virtualizeDeferredTimer = setTimeout(() => {
+      virtualizeDeferredTimer = 0;
+      if (autoPauseOnChat && chatBusy) return;
+      const now = Date.now();
+      if (shouldYieldToInput(now)) {
+        scheduleDeferredVirtualize((inputYieldUntil - now) + 20);
+        return;
+      }
+      const pending = pendingVirtualizeMargin;
+      pendingVirtualizeMargin = null;
+      virtualizeDeferred = false;
+      scheduleVirtualize(pending);
+    }, delay);
   }
 
   function setOptimizeActive(active) {
@@ -886,6 +1663,51 @@
     return sanitizeValue(value, '');
   }
 
+  const Logger = (() => {
+    const resolveLevel = () => {
+      if (logLevel === 'off') return 'silent';
+      if (IS_PROD && logLevel === 'debug') return 'info';
+      return logLevel;
+    };
+
+    const buildLogger = () => pino({
+      level: resolveLevel(),
+      browser: {
+        asObject: true
+      }
+    });
+
+    let pinoLogger = buildLogger();
+
+    const refresh = () => {
+      pinoLogger = buildLogger();
+    };
+
+    const formatEntry = (level, message, context) => ({
+      timestamp: new Date().toISOString(),
+      level,
+      message: String(message || ''),
+      context: sanitizeContext(context || {})
+    });
+
+    const emit = (level, message, context) => {
+      const entry = formatEntry(level, message, context);
+      if (logToConsole && pinoLogger && typeof pinoLogger[level] === 'function') {
+        pinoLogger[level](entry);
+      }
+      return entry;
+    };
+
+    return {
+      debug: (message, context) => emit('debug', message, context),
+      info: (message, context) => emit('info', message, context),
+      warn: (message, context) => emit('warn', message, context),
+      error: (message, context) => emit('error', message, context),
+      refresh,
+      __selfTest: (context) => formatEntry('info', 'selftest', context)
+    };
+  })();
+
   function logEvent(level, event, data) {
     const safeLevel = LOG_LEVELS[level] ? level : 'info';
     if (!canLog(safeLevel)) return;
@@ -906,15 +1728,10 @@
       source: LOG_SOURCE,
       component: LOG_COMPONENT,
       sessionId: SESSION_ID,
-      version: SCRIPT_VERSION,
-      data: data ?? null
+      version: SCRIPT_VERSION
     };
     pushLog(entry);
-
-    if (logToConsole) {
-      const fn = (safeLevel === 'warn') ? 'warn' : (safeLevel === 'error') ? 'error' : 'log';
-      console[fn](formatLogLine(entry));
-    }
+    Logger[safeLevel](eventName, context);
   }
 
   function setLogLevel(level) {
@@ -922,6 +1739,7 @@
     if (IS_PROD && next === 'debug') next = 'info';
     logLevel = next;
     localStorage.setItem(LOG_KEY, next);
+    Logger.refresh();
     logEvent('info', 'logLevel', {
       level: next,
       note: 'Use CGPT_VS.exportLogs() or the panel button to export logs.'
@@ -931,6 +1749,7 @@
   function setLogConsole(enabled) {
     logToConsole = !!enabled;
     localStorage.setItem(LOG_CONSOLE_KEY, logToConsole ? '1' : '0');
+    Logger.refresh();
     logEvent('info', 'logConsole', {
       enabled: logToConsole
     });
@@ -1439,7 +2258,6 @@
 
   function dumpLogs(reason) {
     const text = buildLogExportText(reason);
-    if (logToConsole) console.log(text);
     return text;
   }
 
@@ -1457,6 +2275,161 @@
     return true;
   }
   // endregion: Logging & Diagnostics
+
+  // region: SelfCheck
+  // ========================== 自检入口（TDD 执行器） ==========================
+  const SelfCheck = (() => {
+    const tests = [];
+    const register = (name, fn) => {
+      tests.push({
+        name: String(name || 'unnamed'),
+        fn
+      });
+    };
+    const run = () => {
+      const results = tests.map((test) => {
+        try {
+          const out = test.fn();
+          const ok = !!(out && out.ok);
+          return {
+            name: test.name,
+            ok,
+            detail: out && out.detail ? String(out.detail) : ''
+          };
+        }
+        catch (err) {
+          return {
+            name: test.name,
+            ok: false,
+            detail: err && err.message ? err.message : String(err)
+          };
+        }
+      });
+      const ok = results.every((result) => result.ok);
+      return { ok, results };
+    };
+    return { register, run };
+  })();
+
+  SelfCheck.register('logger.schema', () => {
+    const entry = Logger.__selfTest();
+    const ok = !!(entry && entry.timestamp && entry.level && entry.message && entry.context);
+    return {
+      ok,
+      detail: ok ? '' : 'missing fields'
+    };
+  });
+
+  SelfCheck.register('logger.sanitize', () => {
+    const entry = Logger.__selfTest({
+      token: 'secret',
+      password: 'x'
+    });
+    const ok = entry.context &&
+      entry.context.token === '[REDACTED]' &&
+      entry.context.password === '[REDACTED]';
+    return {
+      ok,
+      detail: ok ? '' : 'sensitive data not redacted'
+    };
+  });
+
+  SelfCheck.register('scheduler.gate', () => {
+    const ok = Scheduler.shouldRun({
+      hidden: true,
+      chatBusy: true,
+      paused: true
+    }) === false;
+    return {
+      ok,
+      detail: ok ? '' : 'gate should block'
+    };
+  });
+
+  SelfCheck.register('store.update', () => {
+    const store = createStore({ a: 1 });
+    store.set({ a: 2 });
+    return {
+      ok: store.get().a === 2,
+      detail: 'store did not update'
+    };
+  });
+
+  SelfCheck.register('virt.marginPlanner', () => {
+    const out = planMarginsDP(100, 'balanced', { soft: 2, hard: 4 });
+    const ok = !!(out && out.soft >= 1 && out.hard >= out.soft + 1);
+    return {
+      ok,
+      detail: ok ? '' : 'planner output invalid'
+    };
+  });
+
+  SelfCheck.register('monitor.pow', () => {
+    const info = findPowDataInJson({ pow: { difficulty: '0x1a2b' } });
+    const ok = !!(info && info.difficulty === '0x1a2b');
+    return {
+      ok,
+      detail: ok ? '' : 'pow parse failed'
+    };
+  });
+
+  SelfCheck.register('ui.format', () => {
+    const ui = formatUIState({ mode: 'balanced', dom: 1000 });
+    const ok = ui && ui.modeLabel === modeLabel('balanced');
+    return {
+      ok,
+      detail: ok ? '' : 'ui state format failed'
+    };
+  });
+  // endregion: SelfCheck
+
+  // region: Scheduler
+  // ========================== 统一调度与门禁 ==========================
+  const Scheduler = (() => {
+    const timers = new Set();
+    const shouldRun = (state) => {
+      if (!state) return true;
+      if (state.hidden || state.chatBusy || state.paused) return false;
+      return true;
+    };
+    const setTimeoutSafe = (fn, ms) => {
+      const id = setTimeout(fn, ms);
+      timers.add(id);
+      return id;
+    };
+    const clearAll = () => {
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
+    };
+    return {
+      shouldRun,
+      setTimeoutSafe,
+      clearAll
+    };
+  })();
+  // endregion: Scheduler
+
+  // region: Store
+  // ========================== 统一状态仓储 ==========================
+  const createStore = (initial) => {
+    let state = { ...initial };
+    const listeners = new Set();
+    const get = () => ({ ...state });
+    const set = (patch) => {
+      state = { ...state, ...patch };
+      listeners.forEach((fn) => fn(get()));
+    };
+    const subscribe = (fn) => {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    };
+    return {
+      get,
+      set,
+      subscribe
+    };
+  };
+  // endregion: Store
 
   // region: Degradation Monitor (network + parsing)
   // ========================== 服务降级监控：工具函数 ==========================
@@ -1518,6 +2491,34 @@
   function isJsonContentType(contentType) {
     const ct = String(contentType || '').toLowerCase();
     return ct.includes('application/json') || ct.includes('+json');
+  }
+
+  const POW_JSON_PARSE_MAX_BYTES = 180 * 1024;
+  const POW_JSON_ALLOW_RE = /\/(?:backend-api|api)\/sentinel\//i;
+  const POW_JSON_BLOCK_RE = /\/backend-api\/conversations?(?:\/|$)|\/backend-api\/conversation(?:\/|$)/i;
+
+  function getSameOriginPath(url) {
+    if (!url) return '';
+    if (url.startsWith('/')) return url;
+    if (url.startsWith(location.origin)) return url.slice(location.origin.length);
+    return '';
+  }
+
+  function parseContentLength(raw) {
+    if (!raw) return Number.NaN;
+    const parsed = Number.parseInt(String(raw), 10);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+
+  function shouldParsePowJsonByUrl(url, contentLength) {
+    const path = getSameOriginPath(String(url || ''));
+    if (!path) return false;
+    if (!/\/(backend-api|api)\//i.test(path)) return false;
+    if (isChatRequirementsUrl(path)) return true;
+    if (POW_JSON_ALLOW_RE.test(path)) return true;
+    if (POW_JSON_BLOCK_RE.test(path)) return false;
+    if (!Number.isFinite(contentLength)) return false;
+    return contentLength <= POW_JSON_PARSE_MAX_BYTES;
   }
 
   function getResourceUrl(resource, response) {
@@ -1817,27 +2818,27 @@
     const labelZh = (text) => text;
     const labelEn = (text) => text;
     if (n <= 10) {
-      return { label: lang === 'zh' ? labelZh('极低') : labelEn('Very Low'), short: lang === 'zh' ? '极低' : 'Very Low', probability: '0%–1%', color: '#22c55e', severity: 'ok' };
+      return { label: lang === 'zh' ? labelZh('极低风险') : labelEn('Very Low'), short: lang === 'zh' ? '极低风险' : 'Very Low', probability: '0%–1%', color: '#22c55e', severity: 'ok' };
     }
     if (n <= 20) {
-      return { label: lang === 'zh' ? labelZh('很低') : labelEn('Low'), short: lang === 'zh' ? '很低' : 'Low', probability: '1%–3%', color: '#84cc16', severity: 'ok' };
+      return { label: lang === 'zh' ? labelZh('很低风险') : labelEn('Low'), short: lang === 'zh' ? '很低风险' : 'Low', probability: '1%–3%', color: '#84cc16', severity: 'ok' };
     }
     if (n <= 35) {
-      return { label: lang === 'zh' ? labelZh('低') : labelEn('Lower'), short: lang === 'zh' ? '低' : 'Lower', probability: '3%–8%', color: '#a3e635', severity: 'ok' };
+      return { label: lang === 'zh' ? labelZh('低风险') : labelEn('Lower'), short: lang === 'zh' ? '低风险' : 'Lower', probability: '3%–8%', color: '#a3e635', severity: 'ok' };
     }
     if (n <= 50) {
-      return { label: lang === 'zh' ? labelZh('中') : labelEn('Medium'), short: lang === 'zh' ? '中' : 'Medium', probability: '8%–20%', color: '#f59e0b', severity: 'warn' };
+      return { label: lang === 'zh' ? labelZh('中风险') : labelEn('Medium'), short: lang === 'zh' ? '中风险' : 'Medium', probability: '8%–20%', color: '#f59e0b', severity: 'warn' };
     }
     if (n <= 65) {
-      return { label: lang === 'zh' ? labelZh('中高') : labelEn('Med-High'), short: lang === 'zh' ? '中高' : 'Med-High', probability: '20%–45%', color: '#f97316', severity: 'warn' };
+      return { label: lang === 'zh' ? labelZh('中高风险') : labelEn('Med-High'), short: lang === 'zh' ? '中高风险' : 'Med-High', probability: '20%–45%', color: '#f97316', severity: 'warn' };
     }
     if (n <= 80) {
-      return { label: lang === 'zh' ? labelZh('高') : labelEn('High'), short: lang === 'zh' ? '高' : 'High', probability: '45%–75%', color: '#ef4444', severity: 'bad' };
+      return { label: lang === 'zh' ? labelZh('高风险') : labelEn('High'), short: lang === 'zh' ? '高风险' : 'High', probability: '45%–75%', color: '#ef4444', severity: 'bad' };
     }
     if (n <= 90) {
-      return { label: lang === 'zh' ? labelZh('很高') : labelEn('Very High'), short: lang === 'zh' ? '很高' : 'Very High', probability: '75%–92%', color: '#dc2626', severity: 'bad' };
+      return { label: lang === 'zh' ? labelZh('很高风险') : labelEn('Very High'), short: lang === 'zh' ? '很高风险' : 'Very High', probability: '75%–92%', color: '#dc2626', severity: 'bad' };
     }
-    return { label: lang === 'zh' ? labelZh('极高') : labelEn('Extreme'), short: lang === 'zh' ? '极高' : 'Extreme', probability: '92%–99%', color: '#b91c1c', severity: 'bad' };
+    return { label: lang === 'zh' ? labelZh('极高风险') : labelEn('Extreme'), short: lang === 'zh' ? '极高风险' : 'Extreme', probability: '92%–99%', color: '#b91c1c', severity: 'bad' };
   }
 
   // Compact Chinese labels for the top "traffic light" bar to avoid long English strings.
@@ -2407,7 +3408,9 @@
     try {
       const url = xhr.__cgpt_xhr_url || '';
       const contentType = xhr.getResponseHeader('content-type') || '';
-      if (!isChatRequirementsUrl(url) && !isJsonContentType(contentType)) return;
+      if (!isJsonContentType(contentType)) return;
+      const contentLength = parseContentLength(xhr.getResponseHeader('content-length'));
+      if (!shouldParsePowJsonByUrl(url, contentLength)) return;
       const text = xhr.responseText || '';
       if (!text) return;
       const data = parseJsonTextSafe(text);
@@ -2425,10 +3428,10 @@
     const sameOrigin = !url || url.startsWith('/') || url.startsWith(location.origin);
     if (!sameOrigin) return;
     if (isChatRequirementsUrl(url)) return;
-    const path = url && url.startsWith(location.origin) ? url.slice(location.origin.length) : url;
-    if (path && !/\/backend-|\/api\//i.test(path)) return;
     const contentType = response.headers?.get?.('content-type') || '';
     if (!isJsonContentType(contentType)) return;
+    const contentLength = parseContentLength(response.headers?.get?.('content-length'));
+    if (!shouldParsePowJsonByUrl(url, contentLength)) return;
     let cloned;
     try {
       cloned = response.clone();
@@ -2543,8 +3546,7 @@
     if (degradedTimers.fetchMonitor) return;
     const startAt = Date.now();
     const tick = () => {
-      ensureFetchHook();
-      ensureXhrHook();
+      Monitor.installHooks();
       const elapsed = Date.now() - startAt;
       const delay = elapsed < 60000 ? DEG_FETCH_MONITOR_FAST_MS : DEG_FETCH_MONITOR_SLOW_MS;
       degradedTimers.fetchMonitor = setTimeout(tick, delay);
@@ -2555,15 +3557,30 @@
   function startDegradedMonitors() {
     if (degradedStarted) return;
     degradedStarted = true;
-    ensureFetchHook();
-    ensureXhrHook();
+    Monitor.installHooks();
     startFetchMonitor();
-    refreshServiceStatus(true);
-    refreshIPInfo(true);
-    refreshPowViaRequirements(false);
+    Monitor.refreshAll(true, { pow: false });
     degradedTimers.status = setInterval(() => refreshServiceStatus(false), DEG_STATUS_REFRESH_MS);
     degradedTimers.ip = setInterval(() => refreshIPInfo(false), DEG_IP_REFRESH_MS);
   }
+
+  const Monitor = (() => {
+    const installHooks = () => {
+      ensureFetchHook();
+      ensureXhrHook();
+    };
+    const refreshAll = (force, opts = {}) => {
+      const includePow = !!opts.pow;
+      installHooks();
+      refreshServiceStatus(!!force);
+      refreshIPInfo(!!force);
+      refreshPowViaRequirements(includePow ? !!force : false);
+    };
+    return {
+      installHooks,
+      refreshAll
+    };
+  })();
   // endregion: Degradation Monitor (network + parsing)
 
   // region: Health Scoring & Telemetry
@@ -2873,6 +3890,52 @@
     return -3;
   }
 
+  function getOptimizeProfile(mode) {
+    return MODE_OPTIMIZE_PROFILES[mode] || MODE_OPTIMIZE_PROFILES.balanced;
+  }
+
+  function resolvePressureThresholds(profile) {
+    const thresholds = profile?.pressure || {};
+    const medium = Number.isFinite(thresholds.medium) ? thresholds.medium : DEFAULT_PRESSURE_THRESHOLDS.medium;
+    const high = Number.isFinite(thresholds.high) ? thresholds.high : DEFAULT_PRESSURE_THRESHOLDS.high;
+    const critical = Number.isFinite(thresholds.critical) ? thresholds.critical : DEFAULT_PRESSURE_THRESHOLDS.critical;
+    return {
+      medium,
+      high,
+      critical
+    };
+  }
+
+  function resolveDeltaByPressure(profile) {
+    const delta = profile?.deltaByPressure || DEFAULT_OPTIMIZE_DELTA_BY_LEVEL;
+    return {
+      low: Number.isFinite(delta.low) ? delta.low : DEFAULT_OPTIMIZE_DELTA_BY_LEVEL.low,
+      medium: Number.isFinite(delta.medium) ? delta.medium : DEFAULT_OPTIMIZE_DELTA_BY_LEVEL.medium,
+      high: Number.isFinite(delta.high) ? delta.high : DEFAULT_OPTIMIZE_DELTA_BY_LEVEL.high,
+      critical: Number.isFinite(delta.critical) ? delta.critical : DEFAULT_OPTIMIZE_DELTA_BY_LEVEL.critical
+    };
+  }
+
+  function getAutoOptimizeMinTurns(mode) {
+    const profile = getOptimizeProfile(mode);
+    const minTurns = Number.isFinite(profile.autoOptimizeMinTurns)
+      ? profile.autoOptimizeMinTurns
+      : AUTO_OPTIMIZE_MIN_TURNS;
+    return Math.max(0, Math.round(minTurns));
+  }
+
+  function resolvePressureLevel(profile, key, fallback) {
+    const level = profile ? profile[key] : null;
+    if (PRESSURE_LEVEL_ORDER[level] == null) return fallback;
+    return level;
+  }
+
+  function isPressureAtLeast(level, target) {
+    const current = PRESSURE_LEVEL_ORDER[level] ?? PRESSURE_LEVEL_ORDER.low;
+    const threshold = PRESSURE_LEVEL_ORDER[target] ?? PRESSURE_LEVEL_ORDER.low;
+    return current >= threshold;
+  }
+
   function getAutoHardTurnFactor(turns) {
     const t = Math.max(0, Number(turns) || 0);
     for (let i = 0; i < AUTO_HARD_TURN_STEPS.length; i += 1) {
@@ -2883,10 +3946,8 @@
 
   function computeAutoHardThreshold(turns, mode) {
     const base = AUTO_HARD_DOM_THRESHOLD;
-    const modeFactor =
-      (mode === 'performance') ? 0.88 :
-      (mode === 'conservative') ? 1.12 :
-      1.0;
+    const profile = getOptimizeProfile(mode);
+    const modeFactor = Number.isFinite(profile.autoHardFactor) ? profile.autoHardFactor : 1.0;
     const turnFactor = getAutoHardTurnFactor(turns);
     const raw = Math.round(base * modeFactor * turnFactor);
     const min = Math.max(3500, Math.round(DOM_OK * 0.7));
@@ -2894,9 +3955,12 @@
     return clamp(raw, min, max);
   }
 
-  function computeAutoHardExit(threshold) {
-    const raw = Math.round(Number(threshold || AUTO_HARD_EXIT_DOM) * 0.6);
-    const max = Math.min(AUTO_HARD_EXIT_DOM, Math.max(2600, (threshold - 400)));
+  function computeAutoHardExit(threshold, mode) {
+    const profile = getOptimizeProfile(mode);
+    const factor = Number.isFinite(profile.autoHardExitFactor) ? profile.autoHardExitFactor : 0.6;
+    const safeThreshold = Number.isFinite(threshold) ? threshold : AUTO_HARD_EXIT_DOM;
+    const raw = Math.round(safeThreshold * factor);
+    const max = Math.min(AUTO_HARD_EXIT_DOM, Math.max(2600, (safeThreshold - 400)));
     return clamp(raw, 2400, max);
   }
 
@@ -2983,7 +4047,7 @@
     const prev = marginCache.at ? { soft: marginCache.soft, hard: marginCache.hard } : null;
     const planned = planMarginsDP(turns, currentMode, prev);
     const autoHardDom = computeAutoHardThreshold(turns, currentMode);
-    const autoHardExit = computeAutoHardExit(autoHardDom);
+    const autoHardExit = computeAutoHardExit(autoHardDom, currentMode);
 
     marginCache = {
       at: now,
@@ -3001,29 +4065,31 @@
     return marginCache;
   }
 
-  function getResourcePressure(domNodes, usedMB) {
+  function getResourcePressure(domNodes, usedMB, profile) {
     const domRatio = domNodes ? (domNodes / DOM_WARN) : 0;
     const memRatio = (usedMB == null || !isFinite(usedMB)) ? 0 : (usedMB / MEM_WARNING_MB);
     const ratio = Math.max(domRatio, memRatio);
+    const thresholds = resolvePressureThresholds(profile);
     let level = 'low';
-    if (ratio >= OPTIMIZE_PRESSURE_CRITICAL) level = 'critical';
-    else if (ratio >= OPTIMIZE_PRESSURE_HIGH) level = 'high';
-    else if (ratio >= OPTIMIZE_PRESSURE_MED) level = 'medium';
+    if (ratio >= thresholds.critical) level = 'critical';
+    else if (ratio >= thresholds.high) level = 'high';
+    else if (ratio >= thresholds.medium) level = 'medium';
     return {
       ratio,
       domRatio,
       memRatio,
-      level
+      level,
+      thresholds
     };
   }
 
   function planOptimizeMargins(domNodes, usedMB) {
     const base = getDynamicMargins(true);
-    const pressure = getResourcePressure(domNodes, usedMB);
+    const profile = getOptimizeProfile(currentMode);
+    const pressure = getResourcePressure(domNodes, usedMB, profile);
     const limits = MODE_MARGIN_LIMITS[currentMode] || MODE_MARGIN_LIMITS.balanced;
-    let delta = 0;
-    if (pressure.level === 'critical') delta = -2;
-    else if (pressure.level === 'high') delta = -1;
+    const deltaByPressure = resolveDeltaByPressure(profile);
+    const delta = Number.isFinite(deltaByPressure[pressure.level]) ? deltaByPressure[pressure.level] : 0;
     let soft = clamp(base.soft + delta, limits.minSoft, limits.maxSoft);
     let hard = clamp(base.hard + (delta * 2), limits.minHard, limits.maxHard);
     if (hard < soft + 1) hard = Math.min(limits.maxHard, soft + 1);
@@ -3041,30 +4107,50 @@
     return false;
   }
 
-  function isAutoOptimizeReady(turns) {
-    const turnReady = Number.isFinite(turns) && turns >= AUTO_OPTIMIZE_MIN_TURNS;
+  function isAutoOptimizeReady(turns, mode) {
+    const minTurns = getAutoOptimizeMinTurns(mode);
+    const turnReady = Number.isFinite(turns) && turns >= minTurns;
     return turnReady;
   }
 
-  function getOptimizeGateStatus(now, turns) {
+  function getOptimizeGateStatus(now, turns, domNodes, usedMB) {
     const manualOverride = shouldBypassOptimizeGate(now);
-    const loadReady = isAutoOptimizeReady(turns);
+    const loadReady = isAutoOptimizeReady(turns, currentMode);
+    const profile = getOptimizeProfile(currentMode);
+    let pressureReady = false;
+    let pressureLevel = 'na';
+    if (!manualOverride && !loadReady) {
+      const domAvailable = Number.isFinite(domNodes);
+      const memAvailable = Number.isFinite(usedMB);
+      if (domAvailable || memAvailable) {
+        const pressure = getResourcePressure(
+          domAvailable ? domNodes : null,
+          memAvailable ? usedMB : null,
+          profile
+        );
+        const gateLevel = resolvePressureLevel(profile, 'gatePressureLevel', 'high');
+        pressureReady = isPressureAtLeast(pressure.level, gateLevel);
+        pressureLevel = pressure.level;
+      }
+    }
     return {
-      ready: manualOverride || loadReady,
+      ready: manualOverride || loadReady || pressureReady,
       loadReady,
-      manualOverride
+      manualOverride,
+      pressureReady,
+      pressureLevel
     };
   }
 
-  function getOptimizeGateStatusByTurns(now, turns) {
-    return getOptimizeGateStatus(now, turns);
+  function getOptimizeGateStatusByTurns(now, turns, domNodes, usedMB) {
+    return getOptimizeGateStatus(now, turns, domNodes, usedMB);
   }
 
   function setMarginOverridePlan(plan, reason) {
     const now = Date.now();
     const turns = (plan && typeof plan.turns === 'number') ? plan.turns : getTurnCountForMargins();
     const autoHardDom = computeAutoHardThreshold(turns, currentMode);
-    const autoHardExit = computeAutoHardExit(autoHardDom);
+    const autoHardExit = computeAutoHardExit(autoHardDom, currentMode);
     marginCache = {
       at: now,
       soft: plan.soft,
@@ -3085,9 +4171,9 @@
     const usedMB = getUsedHeapMB();
     const planned = planOptimizeMargins(domNodes, usedMB);
     const pressure = planned.pressure;
-    const shouldHard = !useSoftVirtualization ||
-      pressure.level === 'high' ||
-      pressure.level === 'critical';
+    const profile = getOptimizeProfile(currentMode);
+    const hardLevel = resolvePressureLevel(profile, 'hardPressureLevel', 'high');
+    const shouldHard = !useSoftVirtualization || isPressureAtLeast(pressure.level, hardLevel);
 
     virtualizationEnabled = true;
     saveBool(KEY_ENABLED, true);
@@ -3362,16 +4448,35 @@
     }, HARD_SCROLL_IDLE_MS + 20);
   }
 
+  function getMessageBounds(msg, scrollInfo, rootRect) {
+    const rect = msg.getBoundingClientRect();
+    const top = scrollInfo.isWindow
+      ? (rect.top + window.scrollY)
+      : (rect.top - rootRect.top + scrollInfo.root.scrollTop);
+    const height = rect.height;
+    return {
+      top,
+      bottom: top + height,
+      height
+    };
+  }
+
+  function isWithinRange(bounds, keepTop, keepBottom) {
+    return bounds.bottom > keepTop && bounds.top < keepBottom;
+  }
+
   function virtualizeOnce(marginScreensOverride) {
     const pausedByChat = autoPauseOnChat && updateChatBusy(true);
     if (pausedByChat) {
       hardSliceState.active = false;
       optimizeState.active = false;
-      return;
+      return false;
     }
 
     const now = Date.now();
     const gateTurns = getTurnsCountCached(false) || lastTurnsCount || 0;
+    const gateDomNodes = getDomNodeCount();
+    const gateUsedMB = getUsedHeapMB();
 
     const margins = getDynamicMargins();
     const softMarginScreens = (typeof marginScreensOverride === 'number') ?
@@ -3396,7 +4501,7 @@
         return;
       }
 
-      const gate = getOptimizeGateStatusByTurns(now, gateTurns);
+      const gate = getOptimizeGateStatusByTurns(now, gateTurns, gateDomNodes, gateUsedMB);
       if (!gate.ready) {
         clearSoftSlim();
         restoreHardSlimAll();
@@ -3435,7 +4540,7 @@
       return;
     }
 
-    const gate = getOptimizeGateStatusByTurns(now, gateTurns);
+    const gate = getOptimizeGateStatusByTurns(now, gateTurns, gateDomNodes, gateUsedMB);
     if (!gate.ready) {
       if (useSoftVirtualization) clearSoftSlim();
       restoreHardSlimAll();
@@ -3530,24 +4635,20 @@
           hardSliceState.index += 1;
           if (!msg || !msg.getBoundingClientRect) continue;
           processed += 1;
-          const rect = msg.getBoundingClientRect();
-          const top = hardSliceState.scrollInfo.isWindow
-            ? (rect.top + window.scrollY)
-            : (rect.top - hardSliceState.rootRect.top + hardSliceState.scrollInfo.root.scrollTop);
-          const bottom = top + rect.height;
-          const inHard = bottom > hardSliceState.hardKeepTop && top < hardSliceState.hardKeepBottom;
+          const bounds = getMessageBounds(msg, hardSliceState.scrollInfo, hardSliceState.rootRect);
+          const inHard = isWithinRange(bounds, hardSliceState.hardKeepTop, hardSliceState.hardKeepBottom);
 
           if (!inHard) {
             if (useSoftVirtualization && msg.classList.contains(VS_SLIM_CLASS)) {
               softRemoveTargets.push(msg);
             }
-            hardSlimTargets.push({ msg, height: rect.height });
+            hardSlimTargets.push({ msg, height: bounds.height });
             hardSliceState.hardSlimmedCount += 1;
           }
           else {
             if (msg.dataset.vsSlimmed) hardRestoreTargets.push(msg);
             if (useSoftVirtualization) {
-              const inSoft = bottom > hardSliceState.softKeepTop && top < hardSliceState.softKeepBottom;
+              const inSoft = isWithinRange(bounds, hardSliceState.softKeepTop, hardSliceState.softKeepBottom);
               const shouldSoftSlim = !inSoft;
               const hasSoft = msg.classList.contains(VS_SLIM_CLASS);
               if (shouldSoftSlim) {
@@ -3617,23 +4718,21 @@
     const softRemoveTargets = [];
 
     for (const msg of msgs) {
-      const rect = msg.getBoundingClientRect();
-      const top = scrollInfo.isWindow ? (rect.top + window.scrollY) : (rect.top - rootRect.top + scrollInfo.root.scrollTop);
-      const bottom = top + rect.height;
-      const inHard = bottom > hardKeepTop && top < hardKeepBottom;
+      const bounds = getMessageBounds(msg, scrollInfo, rootRect);
+      const inHard = isWithinRange(bounds, hardKeepTop, hardKeepBottom);
 
       if (!inHard) {
         if (useSoftVirtualization && msg.classList.contains(VS_SLIM_CLASS)) {
           softRemoveTargets.push(msg);
         }
-        hardSlimTargets.push({ msg, height: rect.height });
+        hardSlimTargets.push({ msg, height: bounds.height });
         hardSlimmedCount += 1;
         continue;
       }
 
       if (msg.dataset.vsSlimmed) hardRestoreTargets.push(msg);
       if (useSoftVirtualization) {
-        const inSoft = bottom > softKeepTop && top < softKeepBottom;
+        const inSoft = isWithinRange(bounds, softKeepTop, softKeepBottom);
         const shouldSoftSlim = !inSoft;
         const hasSoft = msg.classList.contains(VS_SLIM_CLASS);
         if (shouldSoftSlim) {
@@ -3676,12 +4775,29 @@
   }
 
   function scheduleVirtualize(marginOverride) {
+    const now = Date.now();
+    const pausedByChat = autoPauseOnChat && chatBusy;
+    if (pausedByChat) {
+      virtualizeDeferred = true;
+      if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
+      return;
+    }
+    if (shouldYieldToInput(now)) {
+      virtualizeDeferred = true;
+      if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
+      scheduleDeferredVirtualize((inputYieldUntil - now) + 20);
+      return;
+    }
     if (rafPending) return;
     rafPending = true;
     requestAnimationFrame(() => {
       rafPending = false;
-      virtualizeOnce(marginOverride);
-      updateUI();
+      if (virtualizeDeferred) {
+        virtualizeDeferred = false;
+        pendingVirtualizeMargin = null;
+      }
+      const paused = virtualizeOnce(marginOverride) === false;
+      if (!paused) updateUI();
     });
   }
 
@@ -3715,6 +4831,7 @@
   function installTypingDim() {
     const dim = () => {
       lastInputAt = Date.now();
+      markInputYield(INPUT_OPTIMIZE_GRACE_MS);
       const root = ensureRoot();
       root.classList.add('dim');
       if (typingDimTimer) clearTimeout(typingDimTimer);
@@ -3736,6 +4853,15 @@
       if (!el) return;
       const tag = (el.tagName || '').toLowerCase();
       if (tag === 'textarea' || tag === 'input') dim();
+    }, true);
+
+    document.addEventListener('keydown', (e) => {
+      if (!e || !e.target) return;
+      const el = e.target;
+      const tag = (el.tagName || '').toLowerCase();
+      if (tag !== 'textarea' && tag !== 'input') return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      markInputYield(INPUT_OPTIMIZE_GRACE_MS + 220);
     }, true);
 
     document.addEventListener('focusout', () => {
@@ -4307,7 +5433,7 @@
 
       #${PANEL_ID}{
         position: relative;
-        overflow: hidden;
+        overflow: visible;
         margin-top: 14px;
         width: 640px;
         max-width: min(720px, calc(100vw - 16px));
@@ -4776,6 +5902,21 @@
       }
       .cgpt-vs-k{ color: rgba(0,0,0,0.56); }
       .cgpt-vs-v{ font-variant-numeric: tabular-nums; }
+      .cgpt-vs-org-stats .cgpt-vs-row{
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(140px, 0.9fr);
+        column-gap: 12px;
+        align-items: baseline;
+      }
+      .cgpt-vs-org-stats .cgpt-vs-k{
+        min-width: 0;
+      }
+      .cgpt-vs-org-stats .cgpt-vs-v{
+        min-width: 0;
+        text-align: right;
+        justify-self: end;
+        word-break: break-word;
+      }
 
       .mem-ok{ color:#16a34a; font-weight: 600; }
       .mem-warn{ color:#d97706; font-weight: 600; }
@@ -5226,12 +6367,12 @@
               <div class="cgpt-vs-sectionTitle">
                 <span>${t('sectionStats')}</span>
               </div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '当前模式' : 'Mode'}</span><span class="cgpt-vs-v" data-k="mode">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">DOM</span><span class="cgpt-vs-v" data-k="dom">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '内存（JS 堆）' : 'Memory (JS Heap)'}</span><span class="cgpt-vs-v" data-k="mem">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '虚拟化' : 'Virtualization'}</span><span class="cgpt-vs-v" data-k="virt">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '已对话轮数' : 'Turns'}</span><span class="cgpt-vs-v" data-k="turns">--</span></div>
-              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '推荐可聊剩余' : 'Estimated remaining'}</span><span class="cgpt-vs-v" data-k="remain">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '运行模式' : 'Run Mode'}</span><span class="cgpt-vs-v" data-k="mode">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '动态规划' : 'Dynamic Plan'}</span><span class="cgpt-vs-v" data-k="plan">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? 'DOM节点' : 'DOM Nodes'}</span><span class="cgpt-vs-v" data-k="dom">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '内存（JS堆）' : 'Memory (JS Heap)'}</span><span class="cgpt-vs-v" data-k="mem">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '对话轮次' : 'Turns'}</span><span class="cgpt-vs-v" data-k="turns">--</span></div>
+              <div class="cgpt-vs-row"><span class="cgpt-vs-k">${lang === 'zh' ? '预计剩余轮次' : 'Estimated Remaining Turns'}</span><span class="cgpt-vs-v" data-k="remain">--</span></div>
             </section>
 
             <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-monitor cgpt-vs-deg" id="${DEG_SECTION_ID}" data-org="monitor">
@@ -5405,6 +6546,13 @@
     };
     tokenState.nextAt = 0;
     tick();
+  }
+
+  function formatUIState(state) {
+    return {
+      modeLabel: modeLabel(state.mode),
+      domLabel: Number.isFinite(state.dom) ? String(state.dom) : '--'
+    };
   }
 
   // ========================== UI：事件绑定 ==========================
@@ -5775,7 +6923,7 @@
       if (serviceFresh || serviceHasCache) {
         serviceTag = compact;
         if (degradedState.service.indicator === 'none') {
-          serviceDesc = '服务正常';
+          serviceDesc = 'chat服务正常';
         }
         else if (degradedState.service.indicator === 'minor') {
           serviceDesc = '轻微波动';
@@ -6002,7 +7150,7 @@
     const pauseReason = getPauseReason();
     const displayPauseReason = (pauseReason === 'chat') ? '' : pauseReason;
     const paused = !!displayPauseReason;
-    const loadReady = isAutoOptimizeReady(turns);
+    const loadReady = isAutoOptimizeReady(turns, currentMode);
     if (autoHardDom && virtualizationEnabled && !ctrlFFreeze && !pausedByChat && loadReady) {
       if (domNodes >= autoHardDom && !hardActive && (now - lastAutoHardAt) > AUTO_HARD_COOLDOWN_MS) {
         hardActive = true;
@@ -6034,10 +7182,9 @@
       autoHardBelowAt = 0;
     }
 
-    const gate = getOptimizeGateStatus(now, turns);
-    const standby = virtualizationEnabled && !gate.loadReady && !gate.manualOverride;
+    const gate = getOptimizeGateStatus(now, turns, domNodes, usedMB);
+    const standby = virtualizationEnabled && !gate.ready;
     const standbyShort = standby ? t('optimizeBelowThreshold') : '';
-    const standbyText = standby ? t('optimizeStandby') : '';
 
     if (optimizeGateReady == null) {
       optimizeGateReady = gate.ready;
@@ -6048,6 +7195,8 @@
         ready: gate.ready,
         loadReady: gate.loadReady,
         manualOverride: gate.manualOverride,
+        pressureReady: gate.pressureReady,
+        pressureLevel: gate.pressureLevel,
         turns,
         domNodes,
         memMB: usedMB == null ? null : Number(usedMB.toFixed(1))
@@ -6056,29 +7205,6 @@
         scheduleVirtualize();
       }
     }
-    const hardHint = autoHardDom ? (lang === 'zh' ? `硬阈值≥${autoHardDom}` : `hard ≥${autoHardDom}`) : '';
-    let virtModeLabel = '';
-    if (!useSoftVirtualization) {
-      virtModeLabel = lang === 'zh' ? '硬(不支持软)' : 'Hard (no soft)';
-    }
-    else if (hardActive) {
-      virtModeLabel = lang === 'zh'
-        ? (hardActiveSource === 'auto' ? '混合·硬(自动)' : '混合·硬(手动)')
-        : (hardActiveSource === 'auto' ? 'Hybrid · Hard (auto)' : 'Hybrid · Hard (manual)');
-    }
-    else {
-      virtModeLabel = lang === 'zh'
-        ? (hardHint ? `软（${hardHint}）` : '软')
-        : (hardHint ? `Soft (${hardHint})` : 'Soft');
-    }
-    const virtSuffix = ` · ${virtModeLabel}`;
-    const idleHint = standbyText || (lang === 'zh' ? '当前无需虚拟化' : 'no need now');
-    const virtText = (!virtualizationEnabled) ?
-      (lang === 'zh' ? '已暂停（完整显示）' : 'Paused (full visible)') :
-      (ctrlFFreeze ?
-        ((lang === 'zh' ? '暂停中（Ctrl+F 搜索兼容）' : 'Paused (Find active)') + virtSuffix) :
-        (virt > 0 ? ((lang === 'zh' ? `开启（已虚拟化 ${virt} 条）` : `On (${virt} virtualized)`) + virtSuffix) : ((lang === 'zh' ? `开启（${idleHint}）` : `On (${idleHint})`) + virtSuffix))
-      );
 
     let worst =
       (!virtualizationEnabled) ? 'off' :
@@ -6174,14 +7300,16 @@
     const softScreens = plan.soft;
     const hardScreens = plan.hard;
     const showPlan = Number.isFinite(softScreens) && Number.isFinite(hardScreens);
-    let modeText = modeLabel(currentMode);
-    if (showPlan) {
-      const planSuffix = standbyShort ? (lang === 'zh' ? `，${standbyShort}` : `, ${standbyShort}`) : '';
-      modeText = (lang === 'zh') ?
-        `${modeLabel(currentMode)}（规划·软×${softScreens} / 硬×${hardScreens}屏${planSuffix}）` :
-        `${modeLabel(currentMode)} (Plan: Soft ×${softScreens} / Hard ×${hardScreens}${planSuffix})`;
-    }
+    const uiState = formatUIState({ mode: currentMode, dom: domNodes });
+    const modeText = uiState.modeLabel;
+    const planSuffix = standbyShort ? (lang === 'zh' ? `（${standbyShort}）` : ` (${standbyShort})`) : '';
+    const planText = showPlan
+      ? (lang === 'zh'
+        ? `硬×${hardScreens}屏 / 软×${softScreens}屏${planSuffix}`
+        : `Hard ×${hardScreens} / Soft ×${softScreens}${planSuffix}`)
+      : '--';
     setText('mode', modeText);
+    setText('plan', planText);
     setText('dom', domInfo.label);
 
     const memEl = root.querySelector(`[data-k="mem"]`);
@@ -6193,7 +7321,6 @@
       if (memInfo.level === 'bad') memEl.classList.add('mem-bad');
     }
 
-    setText('virt', virtText);
     setText('turns', `${turns}`);
     setText('remain', remainText);
     setText('tip', suggestionText(domNodes, usedMB, virt, turns));
@@ -6351,14 +7478,11 @@
     PAGE_WIN.CGPT_VS.setLogLevel = setLogLevel;
     PAGE_WIN.CGPT_VS.setLogConsole = setLogConsole;
     PAGE_WIN.CGPT_VS.getState = getStateSnapshot;
+    PAGE_WIN.CGPT_VS.selfCheck = () => SelfCheck.run();
     PAGE_WIN.CGPT_VS.setChatPause = setChatPause;
     PAGE_WIN.CGPT_VS.scrollToLatest = scrollToLatest;
     PAGE_WIN.CGPT_VS.refreshMonitor = () => {
-      ensureFetchHook();
-      ensureXhrHook();
-      refreshServiceStatus(true);
-      refreshIPInfo(true);
-      refreshPowViaRequirements(true);
+      Monitor.refreshAll(true, { pow: true });
     };
 
     logEvent('info', 'boot.start', {
@@ -6434,8 +7558,7 @@
   }
 
   try {
-    ensureFetchHook();
-    ensureXhrHook();
+    Monitor.installHooks();
     startFetchMonitor();
   }
   catch {}
@@ -6443,3 +7566,4 @@
   setTimeout(safeBoot, 900);
   // endregion: Route Guards & Boot
 })();
+
