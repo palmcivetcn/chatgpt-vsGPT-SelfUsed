@@ -64,9 +64,24 @@ function evaluateIdleGate({
   };
 }
 
+function evaluatePauseReason({
+  virtualizationEnabled = true,
+  ctrlFFreeze = false,
+  autoPauseOnChat = false,
+  chatBusy = false,
+  idleBlockedReason = ''
+} = {}) {
+  if (!virtualizationEnabled) return 'manual';
+  if (ctrlFFreeze) return 'find';
+  if (autoPauseOnChat && chatBusy) return 'chat';
+  if (idleBlockedReason) return idleBlockedReason;
+  return '';
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    evaluateIdleGate
+    evaluateIdleGate,
+    evaluatePauseReason
   };
 }
 
@@ -306,6 +321,8 @@ if (__CGPT_BROWSER__) {
       pauseByChat: '回复中',
       pauseByFind: '搜索中',
       pauseByManual: '手动暂停',
+      pauseByInput: '输入中',
+      pauseByScroll: '滚动中',
       monitor: '降级监控',
       monitorRefresh: '刷新监控',
       monitorRefreshTip: '刷新服务状态、IP质量与PoW难度',
@@ -361,6 +378,8 @@ if (__CGPT_BROWSER__) {
       pauseByChat: 'Replying',
       pauseByFind: 'Finding',
       pauseByManual: 'Manual pause',
+      pauseByInput: 'Typing',
+      pauseByScroll: 'Scrolling',
       monitor: 'Monitor',
       monitorRefresh: 'Refresh',
       monitorRefreshTip: 'Refresh status, IP quality, and PoW difficulty',
@@ -472,6 +491,7 @@ if (__CGPT_BROWSER__) {
   let pendingVirtualizeMargin = null;
   let idleDeferSince = 0;
   let idleMaintenanceAt = 0;
+  let idleGateBlockedReason = '';
 
   let followTimer = null;
   let docClickHandler = null;
@@ -1617,6 +1637,14 @@ if (__CGPT_BROWSER__) {
     });
     idleDeferSince = result.deferSince;
     idleMaintenanceAt = result.maintenanceAt;
+    if (result.blocked) {
+      if (inputBusy) idleGateBlockedReason = 'input';
+      else if (scrollBusy) idleGateBlockedReason = 'scroll';
+      else idleGateBlockedReason = '';
+    }
+    else {
+      idleGateBlockedReason = '';
+    }
     return {
       ...result,
       chatBusy: chatBusyNow,
@@ -1849,16 +1877,21 @@ if (__CGPT_BROWSER__) {
   }
 
   function getPauseReason() {
-    if (!virtualizationEnabled) return 'manual';
-    if (ctrlFFreeze) return 'find';
-    if (autoPauseOnChat && chatBusy) return 'chat';
-    return '';
+    return evaluatePauseReason({
+      virtualizationEnabled,
+      ctrlFFreeze,
+      autoPauseOnChat,
+      chatBusy,
+      idleBlockedReason: idleGateBlockedReason
+    });
   }
 
   function pauseReasonLabel(reason) {
     if (reason === 'chat') return t('pauseByChat');
     if (reason === 'find') return t('pauseByFind');
     if (reason === 'manual') return t('pauseByManual');
+    if (reason === 'input') return t('pauseByInput');
+    if (reason === 'scroll') return t('pauseByScroll');
     return '';
   }
 
@@ -1877,6 +1910,16 @@ if (__CGPT_BROWSER__) {
       return lang === 'zh'
         ? '已手动暂停：完整显示历史，但更容易卡顿。'
         : 'Manual pause: full history is visible, but it may be heavier.';
+    }
+    if (reason === 'input') {
+      return lang === 'zh'
+        ? '检测到输入：已延迟优化，等你输入完再恢复。'
+        : 'Typing detected: optimization is deferred until you finish.';
+    }
+    if (reason === 'scroll') {
+      return lang === 'zh'
+        ? '滚动中：已延迟优化，等待空闲后再处理。'
+        : 'Scrolling: deferring optimization until idle.';
     }
     return lang === 'zh'
       ? '状态由性能与服务/IP/PoW 综合评估。'
@@ -2425,6 +2468,38 @@ if (__CGPT_BROWSER__) {
     return {
       ok,
       detail: ok ? '' : 'gate should block'
+    };
+  });
+
+  SelfCheck.register('idleGate.transition', () => {
+    const start = 10000;
+    const blocked = evaluateIdleGate({
+      now: start,
+      chatBusy: false,
+      inputBusy: true,
+      scrollBusy: false,
+      deferSince: 0,
+      maintenanceAt: 0,
+      maxDeferMs: 8000,
+      maintenanceCooldownMs: 2000
+    });
+    const idle = evaluateIdleGate({
+      now: start + 9000,
+      chatBusy: false,
+      inputBusy: false,
+      scrollBusy: false,
+      deferSince: blocked.deferSince,
+      maintenanceAt: blocked.maintenanceAt,
+      maxDeferMs: 8000,
+      maintenanceCooldownMs: 2000
+    });
+    const ok = blocked.blocked &&
+      !blocked.allowMaintenance &&
+      idle.allowMaintenance &&
+      idle.deferSince === 0;
+    return {
+      ok,
+      detail: ok ? '' : 'idle gate transition failed'
     };
   });
 
@@ -4982,9 +5057,6 @@ if (__CGPT_BROWSER__) {
     if (idleState.blocked) {
       virtualizeDeferred = true;
       if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
-      if (idleState.allowMaintenance) {
-        scheduleSoftSync('idle.maintenance');
-      }
       if (!idleState.chatBlocked) {
         const delayHint = idleState.inputBlocked && inputYieldUntil
           ? (inputYieldUntil - now) + 20
@@ -4992,6 +5064,9 @@ if (__CGPT_BROWSER__) {
         scheduleDeferredVirtualize(delayHint);
       }
       return;
+    }
+    if (idleState.allowMaintenance) {
+      scheduleSoftSync('idle.maintenance');
     }
     if (softSyncDeferred) {
       softSyncDeferred = false;

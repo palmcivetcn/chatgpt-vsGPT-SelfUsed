@@ -8,6 +8,7 @@ try {
 }
 
 assert.ok(mod && typeof mod.evaluateIdleGate === 'function', 'evaluateIdleGate export is missing');
+assert.ok(mod && typeof mod.evaluatePauseReason === 'function', 'evaluatePauseReason export is missing');
 
 const now = 10000;
 const base = {
@@ -24,6 +25,15 @@ const base = {
 let res = mod.evaluateIdleGate(base);
 assert.equal(res.blocked, false);
 assert.equal(res.allowMaintenance, false);
+
+const pause = mod.evaluatePauseReason({
+  virtualizationEnabled: true,
+  ctrlFFreeze: false,
+  autoPauseOnChat: true,
+  chatBusy: false,
+  idleBlockedReason: 'input'
+});
+assert.equal(pause, 'input');
 
 res = mod.evaluateIdleGate({ ...base, inputBusy: true });
 assert.equal(res.blocked, true);
