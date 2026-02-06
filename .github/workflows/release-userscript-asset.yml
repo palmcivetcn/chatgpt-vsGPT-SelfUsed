@@ -1,0 +1,26 @@
+name: Upload Userscript Asset
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  upload-userscript-asset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Upload userscript asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          SCRIPT_FILE: ChatGPT Glass Engine gpt super-8.0.0.user.js
+          ASSET_NAME: chatgpt-glass-engine.user.js
+        run: |
+          gh release upload "$TAG" "$SCRIPT_FILE#$ASSET_NAME" --repo "$GITHUB_REPOSITORY" --clobber

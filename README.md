@@ -13,6 +13,11 @@ A glassmorphism long-chat optimizer for ChatGPT: virtual scrolling, health indic
 - Use Tampermonkey (or similar) and import the userscript.
 - Script file: `ChatGPT Glass Engine gpt super-8.0.0.user.js`
 
+## Auto Update
+- Userscript metadata uses `@downloadURL` and `@updateURL` to track the latest GitHub Release asset.
+- Stable asset name: `chatgpt-glass-engine.user.js`.
+- Repository must be public for unauthenticated userscript auto-update checks.
+
 ## Versioning
 - Source of truth: `@version` in the userscript header.
 - Format: `vX.Y.Z`
