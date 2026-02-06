@@ -23,8 +23,14 @@ A glassmorphism long-chat optimizer for ChatGPT: virtual scrolling, health indic
 
 ## Branching
 - `dev`: continuous iteration (never deleted)
+- local flow: use the same workspace and push to `origin/dev` (do not keep a local `.worktrees/dev`)
+- local files: keep only one script source at repo root (`ChatGPT Glass Engine gpt super-8.0.0.user.js`)
 - `main`: stable releases after approval
 
 ## Release Tags
 - Tag name: `v<@version>`
 - Tags are created after merging `dev` into `main`
+
+## License
+- Licensed under the [MIT License](./LICENSE).
+- This project is a secondary modification based on [3150214587/chatgpt-virtual-scrollGPT-](https://github.com/3150214587/chatgpt-virtual-scrollGPT-) (MIT).

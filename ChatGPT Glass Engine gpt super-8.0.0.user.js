@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ChatGPT Glass Engine  super
+// @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      9.1.1
+// @version      1.2.1
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复 + Token估算
 // @license      MIT
 // @match        https://chat.openai.com/*
@@ -18,6 +18,7 @@
 // @grant        unsafeWindow
 // @noframes
 // ==/UserScript==
+// Derived from https://github.com/3150214587/chatgpt-virtual-scrollGPT- (MIT License).
 
 const __CGPT_BROWSER__ = typeof window !== 'undefined' && typeof document !== 'undefined';
 
@@ -78,10 +79,56 @@ function evaluatePauseReason({
   return '';
 }
 
+function resolveUiRefreshDecision({
+  now = Date.now(),
+  force = false,
+  open = false,
+  busy = false,
+  uiCacheAt = 0,
+  lastUiFullAt = 0,
+  sessionStartedAt = 0,
+  initLightUiMs = 0,
+  fullRefreshOpenMs = 0,
+  fullRefreshClosedMs = 0,
+  fullRefreshBusyMs = 0
+} = {}) {
+  const fullInterval = busy
+    ? fullRefreshBusyMs
+    : (open ? fullRefreshOpenMs : fullRefreshClosedMs);
+  const doFull = !!force || !uiCacheAt || !lastUiFullAt || (now - lastUiFullAt) >= fullInterval;
+  const initAge = now - sessionStartedAt;
+  const lightInit = !force && !open && !uiCacheAt && initAge < initLightUiMs;
+  return {
+    fullInterval,
+    doFull,
+    lightInit
+  };
+}
+
+function resolveWorstHealthLevel({
+  virtualizationEnabled = true,
+  memLevel = 'ok',
+  domLevel = 'ok',
+  degradedSeverity = 'ok'
+} = {}) {
+  let worst =
+    (!virtualizationEnabled) ? 'off' :
+    (memLevel === 'bad' || domLevel === 'bad') ? 'bad' :
+    (memLevel === 'warn' || domLevel === 'warn') ? 'warn' :
+    'ok';
+  if (worst !== 'off') {
+    if (degradedSeverity === 'bad') worst = 'bad';
+    else if (degradedSeverity === 'warn' && worst === 'ok') worst = 'warn';
+  }
+  return worst;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
-    evaluatePauseReason
+    evaluatePauseReason,
+    resolveUiRefreshDecision,
+    resolveWorstHealthLevel
   };
 }
 
@@ -164,9 +211,6 @@ if (__CGPT_BROWSER__) {
   const OPTIMIZE_IDLE_CLEAR_MS = 2000;
   const HARD_SCROLL_IDLE_MS = 160;
   const HARD_SCROLL_MAX_DEFER_MS = 1200;
-  const IDLE_OPTIMIZE_SCROLL_IDLE_MS = 240;
-  const IDLE_OPTIMIZE_MAX_DEFER_MS = 8000;
-  const IDLE_OPTIMIZE_MAINTENANCE_COOLDOWN_MS = 2000;
   const SOFT_SYNC_DEBOUNCE_MS = 160;
   const SOFT_SYNC_CHAT_DEBOUNCE_MS = 520;
   const UI_FULL_REFRESH_OPEN_MS = 900;
@@ -321,8 +365,6 @@ if (__CGPT_BROWSER__) {
       pauseByChat: '回复中',
       pauseByFind: '搜索中',
       pauseByManual: '手动暂停',
-      pauseByInput: '输入中',
-      pauseByScroll: '滚动中',
       monitor: '降级监控',
       monitorRefresh: '刷新监控',
       monitorRefreshTip: '刷新服务状态、IP质量与PoW难度',
@@ -378,8 +420,6 @@ if (__CGPT_BROWSER__) {
       pauseByChat: 'Replying',
       pauseByFind: 'Finding',
       pauseByManual: 'Manual pause',
-      pauseByInput: 'Typing',
-      pauseByScroll: 'Scrolling',
       monitor: 'Monitor',
       monitorRefresh: 'Refresh',
       monitorRefreshTip: 'Refresh status, IP quality, and PoW difficulty',
@@ -489,9 +529,6 @@ if (__CGPT_BROWSER__) {
   let virtualizeDeferred = false;
   let virtualizeDeferredTimer = 0;
   let pendingVirtualizeMargin = null;
-  let idleDeferSince = 0;
-  let idleMaintenanceAt = 0;
-  let idleGateBlockedReason = '';
 
   let followTimer = null;
   let docClickHandler = null;
@@ -552,6 +589,7 @@ if (__CGPT_BROWSER__) {
     timer: 0,
     instance: 0
   };
+  let uiRefs = null;
   let moodState = {
     index: -1,
     nextAt: 0,
@@ -1620,39 +1658,6 @@ if (__CGPT_BROWSER__) {
     return !!inputYieldUntil && t < inputYieldUntil;
   }
 
-  function getIdleGateState(now) {
-    const t = Number.isFinite(now) ? now : Date.now();
-    const chatBusyNow = autoPauseOnChat && updateChatBusy(false);
-    const inputBusy = shouldYieldToInput(t);
-    const scrollBusy = !!lastScrollAt && (t - lastScrollAt) < IDLE_OPTIMIZE_SCROLL_IDLE_MS;
-    const result = evaluateIdleGate({
-      now: t,
-      chatBusy: chatBusyNow,
-      inputBusy,
-      scrollBusy,
-      deferSince: idleDeferSince,
-      maintenanceAt: idleMaintenanceAt,
-      maxDeferMs: IDLE_OPTIMIZE_MAX_DEFER_MS,
-      maintenanceCooldownMs: IDLE_OPTIMIZE_MAINTENANCE_COOLDOWN_MS
-    });
-    idleDeferSince = result.deferSince;
-    idleMaintenanceAt = result.maintenanceAt;
-    if (result.blocked) {
-      if (inputBusy) idleGateBlockedReason = 'input';
-      else if (scrollBusy) idleGateBlockedReason = 'scroll';
-      else idleGateBlockedReason = '';
-    }
-    else {
-      idleGateBlockedReason = '';
-    }
-    return {
-      ...result,
-      chatBusy: chatBusyNow,
-      inputBusy,
-      scrollBusy
-    };
-  }
-
   function scheduleDeferredVirtualize(delayMs) {
     if (virtualizeDeferredTimer) return;
     const delay = Math.max(60, Math.min(1200, Number(delayMs) || INPUT_OPTIMIZE_GRACE_MS));
@@ -1877,21 +1882,16 @@ if (__CGPT_BROWSER__) {
   }
 
   function getPauseReason() {
-    return evaluatePauseReason({
-      virtualizationEnabled,
-      ctrlFFreeze,
-      autoPauseOnChat,
-      chatBusy,
-      idleBlockedReason: idleGateBlockedReason
-    });
+    if (!virtualizationEnabled) return 'manual';
+    if (ctrlFFreeze) return 'find';
+    if (autoPauseOnChat && chatBusy) return 'chat';
+    return '';
   }
 
   function pauseReasonLabel(reason) {
     if (reason === 'chat') return t('pauseByChat');
     if (reason === 'find') return t('pauseByFind');
     if (reason === 'manual') return t('pauseByManual');
-    if (reason === 'input') return t('pauseByInput');
-    if (reason === 'scroll') return t('pauseByScroll');
     return '';
   }
 
@@ -1910,16 +1910,6 @@ if (__CGPT_BROWSER__) {
       return lang === 'zh'
         ? '已手动暂停：完整显示历史，但更容易卡顿。'
         : 'Manual pause: full history is visible, but it may be heavier.';
-    }
-    if (reason === 'input') {
-      return lang === 'zh'
-        ? '检测到输入：已延迟优化，等你输入完再恢复。'
-        : 'Typing detected: optimization is deferred until you finish.';
-    }
-    if (reason === 'scroll') {
-      return lang === 'zh'
-        ? '滚动中：已延迟优化，等待空闲后再处理。'
-        : 'Scrolling: deferring optimization until idle.';
     }
     return lang === 'zh'
       ? '状态由性能与服务/IP/PoW 综合评估。'
@@ -2468,38 +2458,6 @@ if (__CGPT_BROWSER__) {
     return {
       ok,
       detail: ok ? '' : 'gate should block'
-    };
-  });
-
-  SelfCheck.register('idleGate.transition', () => {
-    const start = 10000;
-    const blocked = evaluateIdleGate({
-      now: start,
-      chatBusy: false,
-      inputBusy: true,
-      scrollBusy: false,
-      deferSince: 0,
-      maintenanceAt: 0,
-      maxDeferMs: 8000,
-      maintenanceCooldownMs: 2000
-    });
-    const idle = evaluateIdleGate({
-      now: start + 9000,
-      chatBusy: false,
-      inputBusy: false,
-      scrollBusy: false,
-      deferSince: blocked.deferSince,
-      maintenanceAt: blocked.maintenanceAt,
-      maxDeferMs: 8000,
-      maintenanceCooldownMs: 2000
-    });
-    const ok = blocked.blocked &&
-      !blocked.allowMaintenance &&
-      idle.allowMaintenance &&
-      idle.deferSince === 0;
-    return {
-      ok,
-      detail: ok ? '' : 'idle gate transition failed'
     };
   });
 
@@ -3978,18 +3936,10 @@ if (__CGPT_BROWSER__) {
   function syncSoftNodes(reason) {
     if (!useSoftVirtualization) return;
 
-    const now = Date.now();
-    const idleState = getIdleGateState(now);
-    const maintenanceOk = idleState.allowMaintenance || (reason === 'idle.maintenance' && !idleState.chatBlocked);
-    if (idleState.blocked && !maintenanceOk) {
+    const busy = autoPauseOnChat && updateChatBusy(false);
+    if (busy) {
       softSyncDeferred = true;
       setOptimizeActive(false);
-      if (!idleState.chatBlocked) {
-        const delayHint = idleState.inputBlocked && inputYieldUntil
-          ? (inputYieldUntil - now) + 20
-          : IDLE_OPTIMIZE_SCROLL_IDLE_MS;
-        scheduleDeferredVirtualize(delayHint);
-      }
       return;
     }
 
@@ -5053,24 +5003,17 @@ if (__CGPT_BROWSER__) {
 
   function scheduleVirtualize(marginOverride) {
     const now = Date.now();
-    const idleState = getIdleGateState(now);
-    if (idleState.blocked) {
+    const pausedByChat = autoPauseOnChat && chatBusy;
+    if (pausedByChat) {
       virtualizeDeferred = true;
       if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
-      if (!idleState.chatBlocked) {
-        const delayHint = idleState.inputBlocked && inputYieldUntil
-          ? (inputYieldUntil - now) + 20
-          : IDLE_OPTIMIZE_SCROLL_IDLE_MS;
-        scheduleDeferredVirtualize(delayHint);
-      }
       return;
     }
-    if (idleState.allowMaintenance) {
-      scheduleSoftSync('idle.maintenance');
-    }
-    if (softSyncDeferred) {
-      softSyncDeferred = false;
-      scheduleSoftSync('idle.resume');
+    if (shouldYieldToInput(now)) {
+      virtualizeDeferred = true;
+      if (typeof marginOverride === 'number') pendingVirtualizeMargin = marginOverride;
+      scheduleDeferredVirtualize((inputYieldUntil - now) + 20);
+      return;
     }
     if (rafPending) return;
     rafPending = true;
@@ -6717,12 +6660,146 @@ if (__CGPT_BROWSER__) {
     document.documentElement.appendChild(style);
   }
 
+  function getHelpLayerMarkup() {
+    return `
+      <div class="cgpt-vs-helpCard" role="dialog" aria-label="Help">
+        <button class="cgpt-vs-helpClose" id="cgpt-vs-helpClose">${lang === 'zh' ? '关闭' : 'Close'}</button>
+        <div class="cgpt-vs-helpTitle">${lang === 'zh' ? '长对话加速仪表盘（小白版说明）' : 'Long Chat Accelerator (Quick Guide)'}</div>
+
+        <div style="margin:8px 0 10px;">
+          <b>${lang === 'zh' ? '绿/黄/红小圆点是什么？' : 'What is the green/yellow/red dot?'}</b><br/>
+          ${lang === 'zh'
+            ? '它是网页健康度指示灯：绿色=状态好；黄色=负载偏高；红色=接近卡顿区。'
+            : 'It indicates page health: green=good, yellow=high load, red=near lag.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '三段模式怎么选？' : 'How to choose modes?'}</b><br/>
+          ${lang === 'zh'
+            ? '性能=最省资源；平衡=日常推荐；保守=保留更多历史但更吃资源。'
+            : 'Performance=lowest resource; Balanced=recommended; Conservative=keeps more history but uses more resources.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '暂停/启用有什么区别？' : 'Pause vs Enable?'}</b><br/>
+          ${lang === 'zh'
+            ? '启用会把屏幕外历史折叠成占位以减负；暂停会完整显示但更容易卡。'
+            : 'Enable folds off-screen history to reduce load; Pause shows full history but may lag.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '“优化”会丢内容吗？' : 'Does “Optimize” delete content?'}</b><br/>
+          ${lang === 'zh'
+            ? '不会。点击“优化”会根据负载自动选择软/硬与屏数；远距历史可能被占位，靠近会自动恢复。'
+            : 'No. Optimize auto picks soft/hard and screen ranges by load; far history may become placeholders and restores as you scroll near.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? 'Ctrl+F 搜索为什么会变慢？' : 'Why Find (Ctrl+F) can be slower?'}</b><br/>
+          ${lang === 'zh'
+            ? '为了让你能搜到所有历史，脚本会临时恢复完整内容；按 Esc 退出后自动恢复。'
+            : 'To let you search all history, the script temporarily restores full content; press Esc to resume acceleration.'}
+        </div>
+
+        <div style="margin:10px 0;">
+          <b>${lang === 'zh' ? '隐私与声明' : 'Privacy'}</b><br/>
+          ${lang === 'zh'
+            ? '本脚本不上传任何对话内容，所有逻辑均在浏览器本地运行。'
+            : 'This script does not upload your chat. Everything runs locally in your browser.'}
+        </div>
+      </div>
+    `;
+  }
+
+  function ensureHelpLayer() {
+    let help = document.getElementById(HELP_ID);
+    if (help) return help;
+    help = document.createElement('div');
+    help.id = HELP_ID;
+    help.innerHTML = getHelpLayerMarkup();
+    document.body.appendChild(help);
+    return help;
+  }
+
+  function collectDataNodes(root) {
+    const nodes = Object.create(null);
+    root.querySelectorAll('[data-k]').forEach((el) => {
+      const key = el.getAttribute('data-k');
+      if (!key || nodes[key]) return;
+      nodes[key] = el;
+    });
+    return nodes;
+  }
+
+  function collectUiRefs(root) {
+    return {
+      root,
+      btn: root.querySelector('#' + BTN_ID),
+      panel: root.querySelector('#' + PANEL_ID),
+      dot: root.querySelector('#' + DOT_ID),
+      statusText: root.querySelector('#' + STATUS_TEXT_ID),
+      statusPill: root.querySelector('#' + STATUS_PILL_ID),
+      statusMain: root.querySelector('[data-k="statusMain"]'),
+      statusReason: root.querySelector('#' + STATUS_REASON_ID),
+      toggleBtn: root.querySelector('#cgpt-vs-toggle'),
+      pinBtn: root.querySelector('#cgpt-vs-pin'),
+      helpBtn: root.querySelector('#cgpt-vs-helpBtn'),
+      optimizeBtn: root.querySelector('#' + OPTIMIZE_BTN_ID),
+      newChatBtn: root.querySelector('#cgpt-vs-newChat'),
+      autoPauseBtn: root.querySelector('#' + AUTO_PAUSE_BTN_ID),
+      scrollLatestBtn: root.querySelector('#' + SCROLL_LATEST_BTN_ID),
+      logExportBtn: root.querySelector('#' + LOG_EXPORT_BTN_ID),
+      pauseTag: root.querySelector('#' + TOP_PAUSE_TAG_ID),
+      optTag: root.querySelector('#' + TOP_OPT_TAG_ID),
+      topSvcTag: root.querySelector('#' + TOP_SVC_TAG_ID),
+      topIpTag: root.querySelector('#' + TOP_IP_TAG_ID),
+      topPowTag: root.querySelector('#' + TOP_POW_TAG_ID),
+      degSection: root.querySelector('#' + DEG_SECTION_ID),
+      degRefreshBtn: root.querySelector('#' + DEG_REFRESH_BTN_ID),
+      degServiceDesc: root.querySelector('#' + DEG_SERVICE_DESC_ID),
+      degServiceTag: root.querySelector('#' + DEG_SERVICE_TAG_ID),
+      degIpValue: root.querySelector('#' + DEG_IP_VALUE_ID),
+      degIpTag: root.querySelector('#' + DEG_IP_TAG_ID),
+      degIpBadge: root.querySelector('#' + DEG_IP_BADGE_ID),
+      degPowValue: root.querySelector('#' + DEG_POW_VALUE_ID),
+      degPowTag: root.querySelector('#' + DEG_POW_TAG_ID),
+      degPowBar: root.querySelector('#' + DEG_POW_BAR_ID),
+      modeValue: root.querySelector('[data-k="mode"]'),
+      planValue: root.querySelector('[data-k="plan"]'),
+      memValue: root.querySelector('[data-k="mem"]'),
+      dataNodes: collectDataNodes(root)
+    };
+  }
+
+  function refreshUiRefs(root) {
+    if (!root) return null;
+    uiRefs = collectUiRefs(root);
+    return uiRefs;
+  }
+
+  function getUiRefs(root) {
+    const targetRoot = root || document.getElementById(ROOT_ID);
+    if (!targetRoot) return null;
+    if (!uiRefs || uiRefs.root !== targetRoot || !document.body.contains(targetRoot)) {
+      return refreshUiRefs(targetRoot);
+    }
+    if (!uiRefs.panel || !targetRoot.contains(uiRefs.panel)) {
+      return refreshUiRefs(targetRoot);
+    }
+    return uiRefs;
+  }
+
   // ========================== UI：构建 Root ==========================
   function ensureRoot() {
     injectStyles();
 
     let root = document.getElementById(ROOT_ID);
-    if (root) return root;
+    if (root) {
+      const helpLayer = ensureHelpLayer();
+      getUiRefs(root);
+      bindHelpUI(root, helpLayer);
+      return root;
+    }
 
     root = document.createElement('div');
     root.id = ROOT_ID;
@@ -6886,61 +6963,11 @@ if (__CGPT_BROWSER__) {
       </div>
     `;
 
-    const help = document.createElement('div');
-    help.id = HELP_ID;
-    help.innerHTML = `
-      <div class="cgpt-vs-helpCard" role="dialog" aria-label="Help">
-        <button class="cgpt-vs-helpClose" id="cgpt-vs-helpClose">${lang === 'zh' ? '关闭' : 'Close'}</button>
-        <div class="cgpt-vs-helpTitle">${lang === 'zh' ? '长对话加速仪表盘（小白版说明）' : 'Long Chat Accelerator (Quick Guide)'}</div>
-
-        <div style="margin:8px 0 10px;">
-          <b>${lang === 'zh' ? '绿/黄/红小圆点是什么？' : 'What is the green/yellow/red dot?'}</b><br/>
-          ${lang === 'zh'
-            ? '它是网页健康度指示灯：绿色=状态好；黄色=负载偏高；红色=接近卡顿区。'
-            : 'It indicates page health: green=good, yellow=high load, red=near lag.'}
-        </div>
-
-        <div style="margin:10px 0;">
-          <b>${lang === 'zh' ? '三段模式怎么选？' : 'How to choose modes?'}</b><br/>
-          ${lang === 'zh'
-            ? '性能=最省资源；平衡=日常推荐；保守=保留更多历史但更吃资源。'
-            : 'Performance=lowest resource; Balanced=recommended; Conservative=keeps more history but uses more resources.'}
-        </div>
-
-        <div style="margin:10px 0;">
-          <b>${lang === 'zh' ? '暂停/启用有什么区别？' : 'Pause vs Enable?'}</b><br/>
-          ${lang === 'zh'
-            ? '启用会把屏幕外历史折叠成占位以减负；暂停会完整显示但更容易卡。'
-            : 'Enable folds off-screen history to reduce load; Pause shows full history but may lag.'}
-        </div>
-
-        <div style="margin:10px 0;">
-          <b>${lang === 'zh' ? '“优化”会丢内容吗？' : 'Does “Optimize” delete content?'}</b><br/>
-          ${lang === 'zh'
-            ? '不会。点击“优化”会根据负载自动选择软/硬与屏数；远距历史可能被占位，靠近会自动恢复。'
-            : 'No. Optimize auto picks soft/hard and screen ranges by load; far history may become placeholders and restores as you scroll near.'}
-        </div>
-
-        <div style="margin:10px 0;">
-          <b>${lang === 'zh' ? 'Ctrl+F 搜索为什么会变慢？' : 'Why Find (Ctrl+F) can be slower?'}</b><br/>
-          ${lang === 'zh'
-            ? '为了让你能搜到所有历史，脚本会临时恢复完整内容；按 Esc 退出后自动恢复。'
-            : 'To let you search all history, the script temporarily restores full content; press Esc to resume acceleration.'}
-        </div>
-
-        <div style="margin:10px 0;">
-          <b>${lang === 'zh' ? '隐私与声明' : 'Privacy'}</b><br/>
-          ${lang === 'zh'
-            ? '本脚本不上传任何对话内容，所有逻辑均在浏览器本地运行。'
-            : 'This script does not upload your chat. Everything runs locally in your browser.'}
-        </div>
-      </div>
-    `;
-
     document.body.appendChild(root);
-    document.body.appendChild(help);
+    const help = ensureHelpLayer();
 
     applyThemeClass();
+    refreshUiRefs(root);
 
     root.classList.toggle('open', RESTORE_LAST_OPEN && !!wasOpen);
 
@@ -7026,21 +7053,40 @@ if (__CGPT_BROWSER__) {
     };
   }
 
+  function bindHelpUI(root, help) {
+    if (!root || !help) return;
+    const refs = getUiRefs(root);
+    const helpBtn = refs ? refs.helpBtn : root.querySelector('#cgpt-vs-helpBtn');
+    const helpClose = help.querySelector('#cgpt-vs-helpClose');
+    if (helpBtn && helpBtn.dataset.helpBound !== '1') {
+      helpBtn.dataset.helpBound = '1';
+      helpBtn.addEventListener('click', () => help.classList.add('show'));
+    }
+    if (helpClose && helpClose.dataset.helpBound !== '1') {
+      helpClose.dataset.helpBound = '1';
+      helpClose.addEventListener('click', () => help.classList.remove('show'));
+    }
+    if (help.dataset.overlayBound !== '1') {
+      help.dataset.overlayBound = '1';
+      help.addEventListener('click', (e) => {
+        if (e.target === help) help.classList.remove('show');
+      });
+    }
+  }
+
   // ========================== UI：事件绑定 ==========================
   function bindUI(root, help) {
-    const btn = root.querySelector('#' + BTN_ID);
-    const panel = root.querySelector('#' + PANEL_ID);
-
-    const toggleBtn = root.querySelector('#cgpt-vs-toggle');
-    const pinBtn = root.querySelector('#cgpt-vs-pin');
-    const helpBtn = root.querySelector('#cgpt-vs-helpBtn');
-    const helpClose = help.querySelector('#cgpt-vs-helpClose');
-
-    const optimizeBtn = root.querySelector('#' + OPTIMIZE_BTN_ID);
-    const newChatBtn = root.querySelector('#cgpt-vs-newChat');
-    const autoPauseBtn = root.querySelector('#' + AUTO_PAUSE_BTN_ID);
-    const scrollLatestBtn = root.querySelector('#' + SCROLL_LATEST_BTN_ID);
-    const logExportBtn = root.querySelector('#' + LOG_EXPORT_BTN_ID);
+    const refs = getUiRefs(root);
+    const btn = refs ? refs.btn : root.querySelector('#' + BTN_ID);
+    const panel = refs ? refs.panel : root.querySelector('#' + PANEL_ID);
+    const toggleBtn = refs ? refs.toggleBtn : root.querySelector('#cgpt-vs-toggle');
+    const pinBtn = refs ? refs.pinBtn : root.querySelector('#cgpt-vs-pin');
+    const optimizeBtn = refs ? refs.optimizeBtn : root.querySelector('#' + OPTIMIZE_BTN_ID);
+    const newChatBtn = refs ? refs.newChatBtn : root.querySelector('#cgpt-vs-newChat');
+    const autoPauseBtn = refs ? refs.autoPauseBtn : root.querySelector('#' + AUTO_PAUSE_BTN_ID);
+    const scrollLatestBtn = refs ? refs.scrollLatestBtn : root.querySelector('#' + SCROLL_LATEST_BTN_ID);
+    const logExportBtn = refs ? refs.logExportBtn : root.querySelector('#' + LOG_EXPORT_BTN_ID);
+    if (!btn || !panel || !toggleBtn || !pinBtn || !newChatBtn) return;
 
     function setOpen(open) {
       root.classList.toggle('open', open);
@@ -7103,11 +7149,7 @@ if (__CGPT_BROWSER__) {
       });
     });
 
-    helpBtn.addEventListener('click', () => help.classList.add('show'));
-    helpClose.addEventListener('click', () => help.classList.remove('show'));
-    help.addEventListener('click', (e) => {
-      if (e.target === help) help.classList.remove('show');
-    });
+    bindHelpUI(root, help);
 
     pinBtn.addEventListener('click', () => {
       pinned = !pinned;
@@ -7301,10 +7343,11 @@ if (__CGPT_BROWSER__) {
     return false;
   }
 
-  function updateDegradedUI(root, degraded) {
+  function updateDegradedUI(root, degraded, refs) {
     if (!root) return;
+    const ui = refs || getUiRefs(root);
 
-    const refreshBtn = root.querySelector('#' + DEG_REFRESH_BTN_ID);
+    const refreshBtn = ui ? ui.degRefreshBtn : root.querySelector('#' + DEG_REFRESH_BTN_ID);
     if (refreshBtn) {
       refreshBtn.textContent = t('monitorRefresh');
       refreshBtn.title = t('monitorRefreshTip');
@@ -7320,8 +7363,8 @@ if (__CGPT_BROWSER__) {
       }
     }
 
-    const serviceDescEl = root.querySelector('#' + DEG_SERVICE_DESC_ID);
-    const serviceTagEl = root.querySelector('#' + DEG_SERVICE_TAG_ID);
+    const serviceDescEl = ui ? ui.degServiceDesc : root.querySelector('#' + DEG_SERVICE_DESC_ID);
+    const serviceTagEl = ui ? ui.degServiceTag : root.querySelector('#' + DEG_SERVICE_TAG_ID);
     const serviceFresh = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS);
     const serviceHasCache = !!(degradedState.service.description || degradedState.service.indicator);
     const serviceInfo = (serviceFresh || serviceHasCache) ?
@@ -7375,9 +7418,9 @@ if (__CGPT_BROWSER__) {
       serviceTagEl.setAttribute('data-tooltip', serviceTip);
     }
 
-    const ipEl = root.querySelector('#' + DEG_IP_VALUE_ID);
-    const ipTagEl = root.querySelector('#' + DEG_IP_TAG_ID);
-    const ipBadgeEl = root.querySelector('#' + DEG_IP_BADGE_ID);
+    const ipEl = ui ? ui.degIpValue : root.querySelector('#' + DEG_IP_VALUE_ID);
+    const ipTagEl = ui ? ui.degIpTag : root.querySelector('#' + DEG_IP_TAG_ID);
+    const ipBadgeEl = ui ? ui.degIpBadge : root.querySelector('#' + DEG_IP_BADGE_ID);
     const ipQualityFresh = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS);
     const ipHasCache = !!(degradedState.ip.qualityLabel || degradedState.ip.qualityScore != null);
     const ipColor = ipQualityFresh ? degradedState.ip.qualityColor : '#9ca3af';
@@ -7433,9 +7476,9 @@ if (__CGPT_BROWSER__) {
       }
     }
 
-    const powValueEl = root.querySelector('#' + DEG_POW_VALUE_ID);
-    const powTagEl = root.querySelector('#' + DEG_POW_TAG_ID);
-    const powBarEl = root.querySelector('#' + DEG_POW_BAR_ID);
+    const powValueEl = ui ? ui.degPowValue : root.querySelector('#' + DEG_POW_VALUE_ID);
+    const powTagEl = ui ? ui.degPowTag : root.querySelector('#' + DEG_POW_TAG_ID);
+    const powBarEl = ui ? ui.degPowBar : root.querySelector('#' + DEG_POW_BAR_ID);
     const powFresh = isFresh(degradedState.pow.updatedAt, DEG_POW_TTL_MS);
     const powAvailable = !!degradedState.pow.updatedAt;
     const powColor = powFresh ? degradedState.pow.color : '#9ca3af';
@@ -7464,15 +7507,15 @@ if (__CGPT_BROWSER__) {
       powBarEl.style.background = `linear-gradient(90deg, ${powColor}, ${powColor})`;
     }
 
-    const topSvc = root.querySelector('#' + TOP_SVC_TAG_ID);
-    const topIp = root.querySelector('#' + TOP_IP_TAG_ID);
-    const topPow = root.querySelector('#' + TOP_POW_TAG_ID);
+    const topSvc = ui ? ui.topSvcTag : root.querySelector('#' + TOP_SVC_TAG_ID);
+    const topIp = ui ? ui.topIpTag : root.querySelector('#' + TOP_IP_TAG_ID);
+    const topPow = ui ? ui.topPowTag : root.querySelector('#' + TOP_POW_TAG_ID);
     const powMiniText = powAvailable ? powLabel : t('monitorPowWaiting');
     paintMiniItem(topSvc, formatMiniLabel('service', serviceTag), serviceColor, serviceTip);
     paintMiniItem(topIp, formatMiniLabel('ip', ipMiniLabel), ipColor, ipTip);
     paintMiniItem(topPow, formatMiniLabel('pow', powMiniText), powColor, t('monitorPowTip') + (powFresh ? '' : `\n${getStaleHint(degradedState.pow.updatedAt)}`));
 
-    const section = root.querySelector('#' + DEG_SECTION_ID);
+    const section = ui ? ui.degSection : root.querySelector('#' + DEG_SECTION_ID);
     if (section) {
       section.classList.remove('warn', 'bad');
       if (degraded?.severity === 'bad') section.classList.add('bad');
@@ -7499,17 +7542,27 @@ if (__CGPT_BROWSER__) {
   function updateUI(force) {
     if (document.hidden) return;
     const root = ensureRoot();
+    const refs = getUiRefs(root);
 
     updateChatBusy(true);
     const now = Date.now();
     const open = root.classList.contains('open');
     const busy = autoPauseOnChat && chatBusy;
-    const fullInterval = busy
-      ? UI_FULL_REFRESH_BUSY_MS
-      : (open ? UI_FULL_REFRESH_OPEN_MS : UI_FULL_REFRESH_CLOSED_MS);
-    const doFull = !!force || !uiCache.at || !lastUiFullAt || (now - lastUiFullAt) >= fullInterval;
-    const initAge = now - SESSION_STARTED_AT;
-    const lightInit = !force && !open && !uiCache.at && initAge < INIT_LIGHT_UI_MS;
+    const refreshDecision = resolveUiRefreshDecision({
+      now,
+      force: !!force,
+      open,
+      busy,
+      uiCacheAt: uiCache.at,
+      lastUiFullAt,
+      sessionStartedAt: SESSION_STARTED_AT,
+      initLightUiMs: INIT_LIGHT_UI_MS,
+      fullRefreshOpenMs: UI_FULL_REFRESH_OPEN_MS,
+      fullRefreshClosedMs: UI_FULL_REFRESH_CLOSED_MS,
+      fullRefreshBusyMs: UI_FULL_REFRESH_BUSY_MS
+    });
+    const doFull = refreshDecision.doFull;
+    const lightInit = refreshDecision.lightInit;
 
     let domNodes = 0;
     let usedMB = null;
@@ -7614,15 +7667,12 @@ if (__CGPT_BROWSER__) {
       }
     }
 
-    let worst =
-      (!virtualizationEnabled) ? 'off' :
-      (memInfo.level === 'bad' || domInfo.level === 'bad') ? 'bad' :
-      (memInfo.level === 'warn' || domInfo.level === 'warn') ? 'warn' :
-      'ok';
-    if (worst !== 'off') {
-      if (degraded.severity === 'bad') worst = 'bad';
-      else if (degraded.severity === 'warn' && worst === 'ok') worst = 'warn';
-    }
+    const worst = resolveWorstHealthLevel({
+      virtualizationEnabled,
+      memLevel: memInfo.level,
+      domLevel: domInfo.level,
+      degradedSeverity: degraded.severity
+    });
 
     logHealthIfNeeded({
       worst,
@@ -7642,7 +7692,7 @@ if (__CGPT_BROWSER__) {
       domNodes
     });
 
-    const dot = root.querySelector('#' + DOT_ID);
+    const dot = refs ? refs.dot : root.querySelector('#' + DOT_ID);
     if (dot) {
       dot.classList.remove('warn', 'bad', 'off');
       if (worst === 'warn') dot.classList.add('warn');
@@ -7664,11 +7714,11 @@ if (__CGPT_BROWSER__) {
       worst === 'off' ? '#9ca3af' :
       '#10b981';
 
-    const mini = root.querySelector('#' + STATUS_TEXT_ID);
+    const mini = refs ? refs.statusText : root.querySelector('#' + STATUS_TEXT_ID);
     if (mini) {
       mini.textContent = topStatusText;
     }
-    const statusPill = root.querySelector('#' + STATUS_PILL_ID);
+    const statusPill = refs ? refs.statusPill : root.querySelector('#' + STATUS_PILL_ID);
     if (statusPill) {
       statusPill.classList.remove('ok', 'warn', 'bad', 'off');
       if (worst === 'bad') statusPill.classList.add('bad');
@@ -7678,13 +7728,13 @@ if (__CGPT_BROWSER__) {
       paintMiniItem(statusPill, null, statusColor);
     }
 
-    const statusMain = root.querySelector('[data-k="statusMain"]');
+    const statusMain = refs ? refs.statusMain : root.querySelector('[data-k="statusMain"]');
     if (statusMain) {
       statusMain.textContent = panelStatusText;
       statusMain.style.color = statusColor;
     }
 
-    const reasonEl = root.querySelector('#' + STATUS_REASON_ID);
+    const reasonEl = refs ? refs.statusReason : root.querySelector('#' + STATUS_REASON_ID);
     if (reasonEl) {
       let reasonText = pauseReasonText(displayPauseReason);
       if (!paused) {
@@ -7702,7 +7752,9 @@ if (__CGPT_BROWSER__) {
     }
 
     const setText = (k, v) => {
-      const el = root.querySelector(`[data-k="${k}"]`);
+      const cached = refs && refs.dataNodes ? refs.dataNodes[k] : null;
+      const el = cached || root.querySelector(`[data-k="${k}"]`);
+      if (refs && refs.dataNodes && !cached && el) refs.dataNodes[k] = el;
       if (el) el.textContent = v;
     };
     const escapeHtml = (value) => String(value || '')
@@ -7712,7 +7764,9 @@ if (__CGPT_BROWSER__) {
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
     const setValueWithTag = (k, valueText, tagText, tagClass, groupClass) => {
-      const el = root.querySelector(`[data-k="${k}"]`);
+      const cached = refs && refs.dataNodes ? refs.dataNodes[k] : null;
+      const el = cached || root.querySelector(`[data-k="${k}"]`);
+      if (refs && refs.dataNodes && !cached && el) refs.dataNodes[k] = el;
       if (!el) return;
       if (!tagText) {
         el.textContent = valueText;
@@ -7747,7 +7801,7 @@ if (__CGPT_BROWSER__) {
       : '';
     if (gateTag && showPlan) setValueWithTag('plan', planText, gateTag, gate.ready ? 'ok' : 'warn');
     else setText('plan', planText);
-    const planEl = root.querySelector('[data-k="plan"]');
+    const planEl = refs ? refs.planValue : root.querySelector('[data-k="plan"]');
     if (planEl && showPlan) {
       const desiredSoft = Number.isFinite(plan.desiredSoft) ? plan.desiredSoft : softScreens;
       const desiredHard = Number.isFinite(plan.desiredHard) ? plan.desiredHard : hardScreens;
@@ -7785,7 +7839,7 @@ if (__CGPT_BROWSER__) {
     }
     setText('dom', domInfo.label);
 
-    const memEl = root.querySelector(`[data-k="mem"]`);
+    const memEl = refs ? refs.memValue : root.querySelector('[data-k="mem"]');
     if (memEl) {
       memEl.classList.remove('mem-ok', 'mem-warn', 'mem-bad');
       const memParts = splitParenLabel(memInfo.label);
@@ -7806,7 +7860,7 @@ if (__CGPT_BROWSER__) {
     setText('remain', remainText);
     setText('tip', suggestionText(domNodes, usedMB, virt, turns));
 
-    const toggleBtn = root.querySelector('#cgpt-vs-toggle');
+    const toggleBtn = refs ? refs.toggleBtn : root.querySelector('#cgpt-vs-toggle');
     if (toggleBtn) {
       if (!virtualizationEnabled) {
         toggleBtn.textContent = lang === 'zh' ? '启用' : 'Enable';
@@ -7824,19 +7878,19 @@ if (__CGPT_BROWSER__) {
       }
     }
 
-    const pinBtn = root.querySelector('#cgpt-vs-pin');
+    const pinBtn = refs ? refs.pinBtn : root.querySelector('#cgpt-vs-pin');
     if (pinBtn) pinBtn.textContent = pinned ? (lang === 'zh' ? '📌已钉' : '📌Pinned') : (lang === 'zh' ? '📌钉住' : '📌Pin');
 
-    const optimizeBtn = root.querySelector('#' + OPTIMIZE_BTN_ID);
+    const optimizeBtn = refs ? refs.optimizeBtn : root.querySelector('#' + OPTIMIZE_BTN_ID);
     if (optimizeBtn) {
       optimizeBtn.textContent = t('optimizeSoft');
       optimizeBtn.title = t('optimizeSoftTip');
     }
 
-    const newBtn = root.querySelector('#cgpt-vs-newChat');
+    const newBtn = refs ? refs.newChatBtn : root.querySelector('#cgpt-vs-newChat');
     if (newBtn) newBtn.textContent = t('newChat');
 
-    const autoPauseBtn = root.querySelector('#' + AUTO_PAUSE_BTN_ID);
+    const autoPauseBtn = refs ? refs.autoPauseBtn : root.querySelector('#' + AUTO_PAUSE_BTN_ID);
     if (autoPauseBtn) {
       autoPauseBtn.textContent = autoPauseOnChat ?
         (lang === 'zh' ? `${t('autoPause')}：开` : `${t('autoPause')}: On`) :
@@ -7845,20 +7899,20 @@ if (__CGPT_BROWSER__) {
       autoPauseBtn.classList.toggle('active', autoPauseOnChat);
     }
 
-    const logExportBtn = root.querySelector('#' + LOG_EXPORT_BTN_ID);
+    const logExportBtn = refs ? refs.logExportBtn : root.querySelector('#' + LOG_EXPORT_BTN_ID);
     if (logExportBtn) {
       logExportBtn.textContent = t('logExport');
       logExportBtn.title = t('logExportTip');
     }
 
-    const latestBtn = root.querySelector('#' + SCROLL_LATEST_BTN_ID);
+    const latestBtn = refs ? refs.scrollLatestBtn : root.querySelector('#' + SCROLL_LATEST_BTN_ID);
     if (latestBtn) {
       latestBtn.textContent = t('scrollLatest');
       latestBtn.title = t('scrollLatestTip');
       latestBtn.classList.remove('active');
     }
 
-    const pauseTag = root.querySelector('#' + TOP_PAUSE_TAG_ID);
+    const pauseTag = refs ? refs.pauseTag : root.querySelector('#' + TOP_PAUSE_TAG_ID);
     if (pauseTag) {
       if (paused) {
         const label = pauseReasonLabel(displayPauseReason) || t('statePaused');
@@ -7874,7 +7928,7 @@ if (__CGPT_BROWSER__) {
       }
     }
 
-    const optTag = root.querySelector('#' + TOP_OPT_TAG_ID);
+    const optTag = refs ? refs.optTag : root.querySelector('#' + TOP_OPT_TAG_ID);
     if (optTag) {
       const optimizing = isOptimizingNow();
       const yielding = pausedByChat;
@@ -7892,7 +7946,7 @@ if (__CGPT_BROWSER__) {
 
     placeMoodSection();
     updateMoodUI(false);
-    updateDegradedUI(root, degraded);
+    updateDegradedUI(root, degraded, refs);
     if (root.classList.contains('booting')) {
       root.classList.remove('booting');
     }
@@ -7906,6 +7960,7 @@ if (__CGPT_BROWSER__) {
       const root = document.getElementById(ROOT_ID);
       if (!root || !document.body.contains(root)) {
         try {
+          uiRefs = null;
           logEvent('warn', 'route.rebuild', {
             reason: !root ? 'missing' : 'detached'
           });
