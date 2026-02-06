@@ -2,9 +2,9 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const scriptPath = path.resolve(__dirname, '..', 'ChatGPT Glass Engine gpt super-8.0.0.user.js');
+const scriptPath = path.resolve(__dirname, '..', 'ChatGPT Glass Engine gpt super.js');
 const script = fs.readFileSync(scriptPath, 'utf8');
-const mod = require('../ChatGPT Glass Engine gpt super-8.0.0.user.js');
+const mod = require('../ChatGPT Glass Engine gpt super.js');
 
 const nameMatch = script.match(/^\/\/ @name\s+(.+)$/m);
 assert.ok(nameMatch, '@name is missing');

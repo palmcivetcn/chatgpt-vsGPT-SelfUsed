@@ -11,7 +11,7 @@ A glassmorphism long-chat optimizer for ChatGPT: virtual scrolling, health indic
 
 ## Install
 - Use Tampermonkey (or similar) and import the userscript.
-- Script file: `ChatGPT Glass Engine gpt super-8.0.0.user.js`
+- Script file: `ChatGPT Glass Engine gpt super.js`
 
 ## Auto Update
 - Userscript metadata uses `@downloadURL` and `@updateURL` to track the latest GitHub Release asset.
@@ -29,7 +29,7 @@ A glassmorphism long-chat optimizer for ChatGPT: virtual scrolling, health indic
 ## Branching
 - `dev`: continuous iteration (never deleted)
 - local flow: use the same workspace and push to `origin/dev` (do not keep a local `.worktrees/dev`)
-- local files: keep only one script source at repo root (`ChatGPT Glass Engine gpt super-8.0.0.user.js`)
+- local files: keep only one script source at repo root (`ChatGPT Glass Engine gpt super.js`)
 - `main`: stable releases after approval
 
 ## Release Tags

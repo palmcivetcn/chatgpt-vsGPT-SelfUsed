@@ -20,7 +20,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-          SCRIPT_FILE: ChatGPT Glass Engine gpt super-8.0.0.user.js
+          SCRIPT_FILE: ChatGPT Glass Engine gpt super.js
           ASSET_NAME: chatgpt-glass-engine.user.js
         run: |
           gh release upload "$TAG" "$SCRIPT_FILE#$ASSET_NAME" --repo "$GITHUB_REPOSITORY" --clobber
