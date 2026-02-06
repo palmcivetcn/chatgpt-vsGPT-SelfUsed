@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.2
+// @version      1.2.3
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复 + Token估算
 // @license      MIT
 // @downloadURL  https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
@@ -17,6 +17,8 @@
 // @connect      ipinfo.io
 // @connect      uapis.cn
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
 // @noframes
 // ==/UserScript==
@@ -125,12 +127,35 @@ function resolveWorstHealthLevel({
   return worst;
 }
 
+function resolvePersistedRaw({
+  gmValue = null,
+  localValue = null
+} = {}) {
+  if (gmValue !== undefined && gmValue !== null) {
+    return {
+      value: gmValue,
+      source: 'gm'
+    };
+  }
+  if (localValue !== undefined && localValue !== null) {
+    return {
+      value: localValue,
+      source: 'local'
+    };
+  }
+  return {
+    value: null,
+    source: 'none'
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
     evaluatePauseReason,
     resolveUiRefreshDecision,
-    resolveWorstHealthLevel
+    resolveWorstHealthLevel,
+    resolvePersistedRaw
   };
 }
 
@@ -4043,24 +4068,79 @@ if (__CGPT_BROWSER__) {
   }
 
   // ========================== 工具函数 ==========================
+  function readPersistedRaw(key) {
+    const canUseGmStorage =
+      (typeof GM_getValue === 'function') &&
+      (typeof GM_setValue === 'function');
+
+    let gmValue = null;
+    if (canUseGmStorage) {
+      try {
+        gmValue = GM_getValue(key, null);
+      }
+      catch {}
+    }
+
+    let localValue = null;
+    try {
+      localValue = localStorage.getItem(key);
+    }
+    catch {}
+
+    const picked = resolvePersistedRaw({
+      gmValue,
+      localValue
+    });
+
+    if (picked.source === 'local' && canUseGmStorage) {
+      try {
+        GM_setValue(key, picked.value);
+      }
+      catch {}
+    }
+    return picked.value;
+  }
+
+  function writePersistedRaw(key, value) {
+    const canUseGmStorage =
+      (typeof GM_getValue === 'function') &&
+      (typeof GM_setValue === 'function');
+
+    const raw = String(value);
+    try {
+      localStorage.setItem(key, raw);
+    }
+    catch {}
+
+    if (canUseGmStorage) {
+      try {
+        GM_setValue(key, raw);
+      }
+      catch {}
+    }
+  }
+
   function loadBool(key, def) {
-    const v = localStorage.getItem(key);
+    const v = readPersistedRaw(key);
     if (v === null || v === undefined) return def;
-    return v === '1';
+    if (v === true || v === 1 || v === '1') return true;
+    if (v === false || v === 0 || v === '0') return false;
+    return def;
   }
 
   function saveBool(key, val) {
-    localStorage.setItem(key, val ? '1' : '0');
+    writePersistedRaw(key, val ? '1' : '0');
   }
 
   function loadMode() {
-    const v = localStorage.getItem(KEY_MODE);
-    return (v === 'performance' || v === 'balanced' || v === 'conservative') ? v : 'balanced';
+    const v = readPersistedRaw(KEY_MODE);
+    const normalized = (v == null) ? '' : String(v);
+    return (normalized === 'performance' || normalized === 'balanced' || normalized === 'conservative') ? normalized : 'balanced';
   }
 
   function saveMode(mode) {
     currentMode = mode;
-    localStorage.setItem(KEY_MODE, mode);
+    writePersistedRaw(KEY_MODE, mode);
     markMarginCacheDirty();
     marginCache.overrideUntil = 0;
     marginCache.overrideReason = '';
@@ -4068,7 +4148,7 @@ if (__CGPT_BROWSER__) {
 
   function loadPos() {
     try {
-      const raw = localStorage.getItem(KEY_POS);
+      const raw = readPersistedRaw(KEY_POS);
       if (!raw) return {
         x: 18,
         y: 64
@@ -4089,7 +4169,7 @@ if (__CGPT_BROWSER__) {
   }
 
   function savePos() {
-    localStorage.setItem(KEY_POS, JSON.stringify(pinnedPos));
+    writePersistedRaw(KEY_POS, JSON.stringify(pinnedPos));
   }
 
   function clamp(n, min, max) {
