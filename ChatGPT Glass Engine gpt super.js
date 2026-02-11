@@ -8,6 +8,9 @@
 // @updateURL    https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
+//               排除codex、图库
+// @exclude      https://chatgpt.com/codex/*
+// @exclude      https://chatgpt.com/library/*
 // @connect      chatgpt.com
 // @connect      chat.openai.com
 // @connect      status.openai.com
@@ -5809,38 +5812,89 @@ if (__CGPT_BROWSER__) {
   function isLikelyModelLabel(text) {
     if (!text) return false;
     const t = text.trim();
-    if (!t || t.length > 80) return false;
-    return /gpt|chatgpt|model|模型|4o|o1|o3|o4|mini|turbo|preview|pro|builder|prompt/i.test(t);
+    if (!t || t.length > 120) return false;
+    return /gpt|chatgpt|model|模型|语音|voice|4o|o1|o3|o4|mini|turbo|preview|pro|builder|prompt|\d+\.\d+/i.test(t);
   }
 
   function resolveButtonCandidate(el) {
     if (!el) return null;
     if (el.closest && el.closest('#' + ROOT_ID)) return null;
     const role = (el.getAttribute('role') || '').toLowerCase();
-    if (el.tagName === 'BUTTON' || role === 'button') return el;
+    const typeAttr = (el.getAttribute('type') || '').toLowerCase();
+    const hasMenu = (el.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
+    if (el.tagName === 'BUTTON' || role === 'button' || typeAttr === 'button' || hasMenu) return el;
     const inner = el.querySelector ? el.querySelector('button, [role="button"]') : null;
     return inner || null;
+  }
+
+  function hasVersionLikeText(text) {
+    if (!text) return false;
+    const t = String(text).trim();
+    if (!t) return false;
+    return /\b\d+\.\d+\b|(?:^|\s)(?:o1|o3|o4|4o|mini|turbo|preview|pro)(?:\s|$)/i.test(t);
+  }
+
+  function hasHeaderStyleSignal(el) {
+    if (!el) return false;
+    const cls = String(el.className || '');
+    if (!/\btext-lg\b/.test(cls)) return false;
+    return /\bpx-2\.5\b|\bwhitespace-nowrap\b|\brounded-lg\b|\bfont-normal\b/.test(cls);
+  }
+
+  function hasModelAnchorAttributes(el) {
+    if (!el) return false;
+    const dataTestId = String(el.getAttribute('data-testid') || '').toLowerCase();
+    const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+    return dataTestId.includes('model-switcher') ||
+      dataTestId.includes('model-switch') ||
+      aria.includes('模型选择器') ||
+      aria.includes('当前模型') ||
+      aria.includes('model selector') ||
+      aria.includes('current model');
+  }
+
+  function hasAnchorSignalText(text) {
+    if (!text) return false;
+    return /chatgpt|gpt|模型|model|语音|voice/i.test(text) || hasVersionLikeText(text);
   }
 
   function scoreModelCandidate(el, mainLeft) {
     if (!isElementVisible(el)) return Infinity;
     const rect = el.getBoundingClientRect();
+    if (rect.bottom < 4) return Infinity;
     if (rect.top > (window.innerHeight * FOLLOW_BOTTOM_ZONE_RATIO)) return Infinity;
-    let score = (rect.top * 6) + rect.left;
-    if (el.closest && el.closest('header')) score -= 140;
-    if (el.closest && el.closest('main')) score -= 60;
-    if (el.closest && el.closest('nav, aside')) score += 900;
-    if (mainLeft && rect.right < (mainLeft - 6)) score += 1200;
-    if (rect.top > 180) score += 600;
-    if (rect.top < 0) score += 300;
-    const label = getElementLabel(el).toLowerCase();
-    if (label) {
-      if (/(?:^|\\b)(?:o1|o3|o4|4o|mini|turbo|preview|pro)(?:\\b|$)/i.test(label)) score -= 140;
-      if (/gpt|chatgpt|model|模型/i.test(label)) score -= 80;
-      if (/builder|prompt/i.test(label)) score -= 40;
-    }
-    if (rect.width > 520) score += 200;
-    if (rect.width < 240) score -= 40;
+    if (rect.top > 220) return Infinity;
+    if (mainLeft && rect.right < (mainLeft - 8)) return Infinity;
+    if (el.closest && el.closest('nav, aside, [data-testid*="sidebar"], [data-testid*="left-rail"]')) return Infinity;
+
+    const label = getElementLabel(el);
+    const hasMenu = (el.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
+    const hasState = !!el.getAttribute('data-state');
+    const hasRadixId = /^radix[-_]/i.test(String(el.id || ''));
+    const hasModelAttrs = hasModelAnchorAttributes(el);
+    const hasSignalText = hasAnchorSignalText(label);
+    const hasVoiceLabel = /chatgpt\s*语音|语音|voice/i.test(label);
+    const hasVersion = hasVersionLikeText(label);
+    const hasHeaderStyle = hasHeaderStyleSignal(el);
+    const strongSignal = hasModelAttrs || hasVoiceLabel || (hasMenu && (hasSignalText || hasVersion));
+    if (!strongSignal) return Infinity;
+
+    let score = (rect.top * 7) + rect.left;
+    if (el.closest && el.closest('header')) score -= 220;
+    if (el.closest && el.closest('main')) score -= 100;
+    if (el.tagName === 'BUTTON') score -= 50;
+    if (hasModelAttrs) score -= 1100;
+    if (hasMenu) score -= 260;
+    if (hasState) score -= 80;
+    if (hasRadixId) score -= 120;
+    if (hasVersion) score -= 180;
+    if (hasSignalText) score -= 180;
+    if (hasVoiceLabel) score -= 260;
+    if (hasHeaderStyle) score -= 80;
+    if (el.querySelector && el.querySelector('svg')) score -= 40;
+    if (rect.top > 150) score += 240;
+    if (rect.width > 620 || rect.height > 120) score += 320;
+    if (String(label || '').length > 120) score += 240;
     return score;
   }
 
@@ -5864,10 +5918,16 @@ if (__CGPT_BROWSER__) {
   function collectModelButtonCandidates(mainLeft) {
     const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
     const selectors = [
-      '[data-testid*="model"]',
+      'button[data-testid="model-switcher-dropdown-button"]',
       '[data-testid*="model-switcher"]',
-      '[data-testid*="model_switcher"]',
       '[data-testid*="model-switch"]',
+      'button[aria-label*="模型选择器"]',
+      'button[aria-label*="当前模型"]',
+      'button[aria-label*="model selector" i]',
+      'button[aria-label*="current model" i]',
+      '[aria-haspopup="menu"][data-state][id^="radix-"]',
+      '[aria-haspopup="menu"][data-state]',
+      '[data-testid*="model"]',
       'button[aria-label*="Model"]',
       'button[aria-label*="模型"]',
       'button[title*="Model"]',
@@ -5881,6 +5941,8 @@ if (__CGPT_BROWSER__) {
         const btn = resolveButtonCandidate(el);
         if (!btn) return;
         if (!isElementVisible(btn)) return;
+        const rect = btn.getBoundingClientRect();
+        if (rect.top > 220) return;
         if (ml && btn.getBoundingClientRect().right < (ml - 6)) return;
         candidates.push(btn);
       });
@@ -5890,18 +5952,22 @@ if (__CGPT_BROWSER__) {
 
   function collectTopBarTextCandidates(mainLeft) {
     const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
-    const topLimit = 140;
+    const topLimit = 220;
     const list = [];
-    document.querySelectorAll('button, [role="button"]').forEach((el) => {
+    document.querySelectorAll(
+      'button, [role="button"], [aria-haspopup="menu"][data-state], [aria-haspopup="menu"][id^="radix-"]'
+    ).forEach((el) => {
       if (!isElementVisible(el)) return;
       if (el.closest && el.closest('#' + ROOT_ID)) return;
       if (el.closest && el.closest('nav, aside')) return;
       const rect = el.getBoundingClientRect();
       if (rect.top > topLimit) return;
       if (ml && rect.right < (ml - 6)) return;
-      const label = ((el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '')).trim();
+      const label = getElementLabel(el);
       if (!label) return;
-      if (!/gpt|chatgpt|model|switch|o1|o3|o4|4o|mini|turbo|preview|pro/i.test(label)) return;
+      const hasMenu = (el.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
+      const hasModelAttrs = hasModelAnchorAttributes(el);
+      if (!(hasModelAttrs || (hasMenu && hasAnchorSignalText(label)) || /chatgpt\s*语音|语音|voice/i.test(label))) return;
       list.push(el);
     });
     return list;
@@ -5921,7 +5987,9 @@ if (__CGPT_BROWSER__) {
       'header h3',
       'header [role="heading"]',
       'header [data-testid*="title"]',
-      'header [data-testid*="model"]'
+      'header [data-testid*="model"]',
+      'main .text-lg',
+      'header .text-lg'
     ];
     const list = [];
     selectors.forEach((sel) => {
@@ -5934,6 +6002,7 @@ if (__CGPT_BROWSER__) {
         if (ml && rect.right < (ml - 6)) return;
         const label = getElementLabel(el);
         if (!isLikelyModelLabel(label)) return;
+        if (sel.includes('.text-lg') && !hasHeaderStyleSignal(el)) return;
         list.push(el);
       });
     });
@@ -5950,38 +6019,13 @@ if (__CGPT_BROWSER__) {
     const candidates = collectModelButtonCandidates(mainLeft)
       .concat(collectTopBarTextCandidates(mainLeft))
       .concat(collectModelLabelAnchors(mainLeft));
-    let best = pickBestModelCandidate(candidates, mainLeft);
+    const best = pickBestModelCandidate(candidates, mainLeft);
     if (best && scoreModelCandidate(best, mainLeft) <= MODEL_CANDIDATE_MAX_SCORE) {
       modelBtnCache = { el: best, at: now };
       return best;
     }
-
-    const header = document.querySelector('header');
-    if (!header) return null;
-
-    const btns = header.querySelectorAll('button, [role="button"]');
-    const headerCandidates = [];
-    for (const b of btns) {
-      const txt = ((b.innerText || b.textContent || '')).trim();
-      if (!txt) continue;
-      if (!isElementVisible(b)) continue;
-      const rect = b.getBoundingClientRect();
-      if (mainLeft && rect.right < (mainLeft - 6)) continue;
-
-      const hit =
-        /chatgpt/i.test(txt) ||
-        /\bgpt\b/i.test(txt) ||
-        txt.includes('模型') ||
-        txt.includes('切换') ||
-        txt.includes('ChatGPT');
-
-      if (hit) headerCandidates.push(b);
-    }
-
-    best = pickBestModelCandidate(headerCandidates, mainLeft);
-    if (best && scoreModelCandidate(best, mainLeft) > MODEL_CANDIDATE_MAX_SCORE) best = null;
-    modelBtnCache = { el: best || null, at: now };
-    return best;
+    modelBtnCache = { el: null, at: now };
+    return null;
   }
 
   function findVoiceActionButton(mainLeft) {
