@@ -8,7 +8,6 @@
 // @updateURL    https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
-//               排除codex、图库
 // @exclude      https://chatgpt.com/codex/*
 // @exclude      https://chatgpt.com/library/*
 // @connect      chatgpt.com
@@ -7649,28 +7648,28 @@ if (__CGPT_BROWSER__) {
     if (lang === 'zh') {
       if (isPinned) {
         return {
-          label: '已钉住',
-          title: '已钉住（可拖动）；点击切换为自动贴合',
-          aria: '已钉住，点击取消钉住并恢复自动贴合'
+          label: '自由',
+          title: '自由（可拖动）；点击切换为贴合（自动跟随）',
+          aria: '当前为自由模式，点击切换为贴合模式'
         };
       }
       return {
-        label: '未钉住',
-        title: '未钉住（自动贴合）；点击钉住后可拖动',
-        aria: '未钉住，点击钉住并启用拖动'
+        label: '贴合',
+        title: '贴合（自动跟随）；点击切换为自由并启用拖动',
+        aria: '当前为贴合模式，点击切换为自由模式'
       };
     }
     if (isPinned) {
       return {
-        label: 'Pinned',
-        title: 'Pinned (draggable). Click to switch back to auto follow.',
-        aria: 'Pinned. Click to unpin and restore auto follow.'
+        label: 'Free',
+        title: 'Free (draggable). Click to switch to Follow (auto).',
+        aria: 'Currently in Free mode. Click to switch to Follow mode.'
       };
     }
     return {
-      label: 'Unpinned',
-      title: 'Unpinned (auto follow). Click to pin and drag manually.',
-      aria: 'Unpinned. Click to pin and drag manually.'
+      label: 'Follow',
+      title: 'Follow (auto). Click to switch to Free and drag manually.',
+      aria: 'Currently in Follow mode. Click to switch to Free mode.'
     };
   }
 
