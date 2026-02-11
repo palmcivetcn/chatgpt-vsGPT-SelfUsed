@@ -149,13 +149,197 @@ function resolvePersistedRaw({
   };
 }
 
+function resolveConversationRouteInfo({
+  url = '',
+  fallbackPath = '/'
+} = {}) {
+  let pathname = String(fallbackPath || '/');
+  if (!pathname) pathname = '/';
+  try {
+    if (url) {
+      const parsed = new URL(String(url), 'https://chatgpt.com');
+      pathname = parsed.pathname || pathname;
+    }
+  }
+  catch {}
+  pathname = String(pathname || '/').trim() || '/';
+  const match = pathname.match(/(?:^|\/)c\/([a-z0-9-]{8,})/i);
+  const conversationId = match ? match[1] : '';
+  const isConversation = !!conversationId;
+  const routeKey = isConversation ? `c:${conversationId}` : pathname;
+  return {
+    pathname,
+    conversationId,
+    isConversation,
+    routeKey
+  };
+}
+
+function resolveRouteAutoScrollDecision({
+  previousRouteKey = '',
+  nextRouteKey = '',
+  now = Date.now(),
+  lastAutoScrollAt = 0,
+  minIntervalMs = 800
+} = {}) {
+  const prev = String(previousRouteKey || '');
+  const next = String(nextRouteKey || '');
+  const changed = !!next && next !== prev;
+  const throttled = !!lastAutoScrollAt && (now - lastAutoScrollAt) < Math.max(0, Number(minIntervalMs) || 0);
+  return {
+    changed,
+    throttled,
+    shouldAutoScroll: changed && !throttled,
+    routeKey: next || prev
+  };
+}
+
+function buildConversationExportMarkdown({
+  title = '',
+  url = '',
+  exportedAtLocal = '',
+  exportedAtIso = '',
+  scriptVersion = '',
+  turns = []
+} = {}) {
+  const safeTitle = String(title || 'ChatGPT Conversation').trim() || 'ChatGPT Conversation';
+  const lines = [`# ${safeTitle}`, ''];
+  if (url) lines.push(`- URL: ${String(url)}`);
+  if (exportedAtLocal || exportedAtIso) {
+    if (exportedAtLocal && exportedAtIso && exportedAtLocal !== exportedAtIso) {
+      lines.push(`- Exported: ${exportedAtLocal} (${exportedAtIso})`);
+    }
+    else {
+      lines.push(`- Exported: ${exportedAtLocal || exportedAtIso}`);
+    }
+  }
+  if (scriptVersion) lines.push(`- ScriptVersion: ${String(scriptVersion)}`);
+  const safeTurns = Array.isArray(turns) ? turns : [];
+  lines.push(`- Turns: ${safeTurns.length}`);
+  lines.push('');
+
+  if (!safeTurns.length) {
+    lines.push('_No conversation content captured._');
+    return lines.join('\n').trimEnd();
+  }
+
+  safeTurns.forEach((turn, index) => {
+    const roleRaw = String((turn && turn.role) || '').toLowerCase();
+    const role = roleRaw === 'assistant'
+      ? 'Assistant'
+      : roleRaw === 'system'
+        ? 'System'
+        : 'User';
+    const text = String((turn && turn.text) || '').trim();
+    lines.push(`## ${index + 1}. ${role}`);
+    lines.push('');
+    lines.push(text || '_[empty]_');
+    lines.push('');
+  });
+  return lines.join('\n').trimEnd();
+}
+
+function resolveOptimizingStatus({
+  virtualizationEnabled = true,
+  ctrlFFreeze = false,
+  autoPauseOnChat = true,
+  chatBusy = false,
+  gateReady = false,
+  hardSliceActive = false,
+  optimizeActive = false,
+  lastWorkAt = 0,
+  optimizeBusyUntil = 0,
+  optimizeHoldMs = 420,
+  now = Date.now()
+} = {}) {
+  const holdMs = Math.max(0, Number(optimizeHoldMs) || 0);
+  const tsNow = Number.isFinite(now) ? now : Date.now();
+  let nextBusyUntil = Number.isFinite(optimizeBusyUntil) ? optimizeBusyUntil : 0;
+
+  if (!virtualizationEnabled || ctrlFFreeze || (autoPauseOnChat && chatBusy)) {
+    return {
+      optimizing: false,
+      nextBusyUntil
+    };
+  }
+
+  if (hardSliceActive || optimizeActive) {
+    nextBusyUntil = Math.max(nextBusyUntil, tsNow + holdMs);
+    return {
+      optimizing: true,
+      nextBusyUntil
+    };
+  }
+
+  if (nextBusyUntil > tsNow) {
+    return {
+      optimizing: true,
+      nextBusyUntil
+    };
+  }
+
+  if (gateReady && lastWorkAt && (tsNow - lastWorkAt) < holdMs) {
+    return {
+      optimizing: true,
+      nextBusyUntil: 0
+    };
+  }
+
+  return {
+    optimizing: false,
+    nextBusyUntil: 0
+  };
+}
+
+function buildStructuredLogExport({
+  schemaVersion = '2.0.0',
+  source = 'cgpt_glass_engine',
+  component = 'userscript',
+  generatedAtIso = '',
+  generatedAtLocal = '',
+  reason = '',
+  session = {},
+  conversation = {},
+  health = {},
+  runtime = {},
+  bugFocus = {},
+  events = []
+} = {}) {
+  const safeEvents = Array.isArray(events) ? events : [];
+  return {
+    schema: {
+      name: 'cgpt_glass_log_export',
+      version: String(schemaVersion || '2.0.0'),
+      format: 'json',
+      source: String(source || 'cgpt_glass_engine'),
+      component: String(component || 'userscript')
+    },
+    meta: {
+      generated_at_iso: String(generatedAtIso || new Date().toISOString()),
+      generated_at_local: String(generatedAtLocal || ''),
+      reason: String(reason || '')
+    },
+    session: session && typeof session === 'object' ? session : {},
+    conversation: conversation && typeof conversation === 'object' ? conversation : {},
+    health: health && typeof health === 'object' ? health : {},
+    runtime: runtime && typeof runtime === 'object' ? runtime : {},
+    bug_focus: bugFocus && typeof bugFocus === 'object' ? bugFocus : {},
+    events: safeEvents
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
     evaluatePauseReason,
     resolveUiRefreshDecision,
     resolveWorstHealthLevel,
-    resolvePersistedRaw
+    resolvePersistedRaw,
+    resolveConversationRouteInfo,
+    resolveRouteAutoScrollDecision,
+    buildConversationExportMarkdown,
+    resolveOptimizingStatus,
+    buildStructuredLogExport
   };
 }
 
@@ -198,6 +382,8 @@ if (__CGPT_BROWSER__) {
   // ========================== 可调参数（一般不用动） ==========================
   const CHECK_INTERVAL_MS = 1500;
   const ROUTE_GUARD_MS = 1200;
+  const ROUTE_AUTO_SCROLL_MIN_INTERVAL_MS = 900;
+  const ROUTE_AUTO_SCROLL_DELAYS_MS = [80, 280, 760, 1500];
   const INPUT_DIM_IDLE_MS = 850;
   const INPUT_OPTIMIZE_GRACE_MS = 680;
   const IMAGE_LOAD_RETRY_MS = 250;
@@ -228,6 +414,9 @@ if (__CGPT_BROWSER__) {
   const TURNS_COUNT_TTL_MS = 900;
   const MARGIN_TURN_STEPS = [80, 220, 360, 520];
   const MODEL_BTN_TTL_MS = 3000;
+  const MODEL_CANDIDATE_MAX_SCORE = 1100;
+  const FOLLOW_BOTTOM_ZONE_RATIO = 0.45;
+  const FOLLOW_ANCHOR_GAP_PX = 8;
   const OPTIMIZE_HOLD_MS = 420;
   const HARD_SLICE_TURNS = 140;
   const HARD_SLICE_BUDGET_MIN_MS = 4;
@@ -408,8 +597,11 @@ if (__CGPT_BROWSER__) {
       monitorCopyHint: '点击复制最近 10 条记录',
       monitorCopied: '已复制',
       monitorCopyFailed: '复制失败',
+      chatExport: '导出对话',
+      chatExportTip: '导出当前对话内容（md）',
+      chatExported: '已导出',
       logExport: '导出日志',
-      logExportTip: '下载诊断日志（txt）',
+      logExportTip: '下载诊断日志（json）',
       logExported: '已导出',
       moodTitle: '每日一言',
       moodTip: '点击换一句',
@@ -463,8 +655,11 @@ if (__CGPT_BROWSER__) {
       monitorCopyHint: 'Click to copy the most recent 10 records',
       monitorCopied: 'Copied',
       monitorCopyFailed: 'Copy failed',
+      chatExport: 'Export Chat',
+      chatExportTip: 'Export current conversation (md)',
+      chatExported: 'Exported',
       logExport: 'Export Logs',
-      logExportTip: 'Download diagnostic logs (txt)',
+      logExportTip: 'Download diagnostic logs (json)',
       logExported: 'Exported',
       moodTitle: 'Mood',
       moodTip: 'Click to refresh',
@@ -512,6 +707,7 @@ if (__CGPT_BROWSER__) {
   const HELP_ID = 'cgpt-vs-help';
   const AUTO_PAUSE_BTN_ID = 'cgpt-vs-autoPause';
   const SCROLL_LATEST_BTN_ID = 'cgpt-vs-scrollLatest';
+  const CHAT_EXPORT_BTN_ID = 'cgpt-vs-chat-export';
   const LOG_EXPORT_BTN_ID = 'cgpt-vs-log-export';
   const DEG_SECTION_ID = 'cgpt-vs-degrade';
   const DEG_REFRESH_BTN_ID = 'cgpt-vs-deg-refresh';
@@ -586,6 +782,9 @@ if (__CGPT_BROWSER__) {
   let lastScrollTop = 0;
   let hardScrollDeferAt = 0;
   let hardScrollIdleTimer = 0;
+  let lastRouteKey = '';
+  let lastRouteAutoScrollAt = 0;
+  let routeAutoScrollTimer = 0;
   let globalScrollHookInstalled = false;
   let msgCache = [];
   let msgCacheDirty = true;
@@ -1482,6 +1681,52 @@ if (__CGPT_BROWSER__) {
     markMarginCacheDirty();
   }
 
+  function reclaimRuntimeCaches(reason, options) {
+    const opts = options || {};
+    if (opts.releaseNodeRefs) {
+      msgCache = [];
+      turnsCountCache = 0;
+      lastTurnsCount = 0;
+      domCountAt = 0;
+      domCountCache = 0;
+    }
+    msgCacheDirty = true;
+    msgCacheAt = 0;
+    turnsCountAt = 0;
+
+    if (opts.resetSoftObservers) {
+      if (softObserver) {
+        softObserver.disconnect();
+        softObserver = null;
+      }
+      softObserved = new Set();
+      softSlimCount = 0;
+      softObserverMargin = '';
+      softObserverRoot = null;
+      if (softSyncTimer) clearTimeout(softSyncTimer);
+      softSyncTimer = 0;
+      softSyncPending = false;
+      softSyncDeferred = false;
+    }
+
+    if (opts.resetMsgObserver) {
+      if (msgObserver) {
+        msgObserver.disconnect();
+        msgObserver = null;
+      }
+      msgContainer = null;
+    }
+
+    if (reason) {
+      logEvent('debug', 'cache.reclaim', {
+        reason,
+        releaseNodeRefs: !!opts.releaseNodeRefs,
+        resetSoftObservers: !!opts.resetSoftObservers,
+        resetMsgObserver: !!opts.resetMsgObserver
+      });
+    }
+  }
+
   function getDomNodeCount() {
     const now = Date.now();
     if (!domCountAt || (now - domCountAt) > DOM_COUNT_TTL_MS) {
@@ -1705,7 +1950,7 @@ if (__CGPT_BROWSER__) {
 
   function setOptimizeActive(active) {
     optimizeState.active = !!active;
-    optimizeState.lastWorkAt = Date.now();
+    if (optimizeState.active) optimizeState.lastWorkAt = Date.now();
   }
 
   function markOptimizeWork() {
@@ -1719,11 +1964,23 @@ if (__CGPT_BROWSER__) {
       hardSliceState.active = false;
       optimizeState.active = false;
     }
-    if (hardSliceState.active || optimizeState.active) {
-      optimizeBusyUntil = now + OPTIMIZE_HOLD_MS;
-      return true;
-    }
-    return now < optimizeBusyUntil || (optimizeState.lastWorkAt && (now - optimizeState.lastWorkAt) < OPTIMIZE_HOLD_MS);
+    const turns = getTurnsCountCached(false) || lastTurnsCount || 0;
+    const gate = getOptimizeGateStatus(now, turns, getDomNodeCount(), getUsedHeapMB());
+    const status = resolveOptimizingStatus({
+      virtualizationEnabled,
+      ctrlFFreeze,
+      autoPauseOnChat,
+      chatBusy,
+      gateReady: !!gate.ready,
+      hardSliceActive: !!hardSliceState.active,
+      optimizeActive: !!optimizeState.active,
+      lastWorkAt: optimizeState.lastWorkAt,
+      optimizeBusyUntil,
+      optimizeHoldMs: OPTIMIZE_HOLD_MS,
+      now
+    });
+    optimizeBusyUntil = status.nextBusyUntil;
+    return !!status.optimizing;
   }
 
   function pushLog(entry) {
@@ -2249,6 +2506,181 @@ if (__CGPT_BROWSER__) {
     return true;
   }
 
+  function getScrollBottomGap(scrollInfo) {
+    const info = scrollInfo || getScrollMetrics();
+    if (info.isWindow) {
+      const doc = document.scrollingElement || document.documentElement || document.body;
+      const maxTop = Math.max(0, (doc.scrollHeight || 0) - window.innerHeight);
+      const top = Math.max(0, Math.round(window.scrollY || 0));
+      return {
+        top,
+        maxTop: Math.round(maxTop),
+        gap: Math.max(0, Math.round(maxTop - top))
+      };
+    }
+    const rootEl = info.root;
+    const maxTop = Math.max(0, (rootEl.scrollHeight || 0) - (rootEl.clientHeight || 0));
+    const top = Math.max(0, Math.round(rootEl.scrollTop || 0));
+    return {
+      top,
+      maxTop: Math.round(maxTop),
+      gap: Math.max(0, Math.round(maxTop - top))
+    };
+  }
+
+  function sanitizeFilenamePart(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    return raw
+      .replace(/[\\/:*?"<>|]+/g, '-')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase();
+  }
+
+  function resolveConversationTitle() {
+    const titleCandidates = [
+      '[data-testid="conversation-title"]',
+      'main h1',
+      'h1'
+    ];
+    for (const selector of titleCandidates) {
+      const el = document.querySelector(selector);
+      if (!el) continue;
+      const txt = String(el.textContent || '').trim();
+      if (txt) return txt;
+    }
+    const title = String(document.title || '').replace(/\s*-\s*ChatGPT.*$/i, '').trim();
+    if (title) return title;
+    return lang === 'zh' ? 'ChatGPT 对话' : 'ChatGPT Conversation';
+  }
+
+  function normalizeExportText(text) {
+    if (!text) return '';
+    return String(text)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\r/g, '')
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+$/g, ''))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function extractTextForExport(node) {
+    if (!node || typeof node.cloneNode !== 'function') return '';
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll('script, style, svg, path, button, textarea, input, select, noscript, iframe, canvas, audio, video, [aria-hidden="true"], .sr-only').forEach((el) => {
+      el.remove();
+    });
+    const text = clone.innerText || clone.textContent || '';
+    return normalizeExportText(text);
+  }
+
+  function inferMessageRole(node) {
+    if (!node || typeof node.getAttribute !== 'function') return 'user';
+    const direct = String(node.getAttribute('data-message-author-role') || '').toLowerCase().trim();
+    if (direct) return direct;
+    const nearest = node.closest('[data-message-author-role]');
+    if (nearest && nearest !== node) {
+      const nearRole = String(nearest.getAttribute('data-message-author-role') || '').toLowerCase().trim();
+      if (nearRole) return nearRole;
+    }
+    const blob = `${node.className || ''} ${node.getAttribute('data-testid') || ''}`.toLowerCase();
+    if (/assistant|model|ai/.test(blob)) return 'assistant';
+    if (/system/.test(blob)) return 'system';
+    return 'user';
+  }
+
+  function collectConversationExportTurns() {
+    const turns = [];
+    const nodes = getMessageNodes();
+    for (const turnEl of nodes) {
+      const localRoleNodes = [];
+      if (turnEl.matches && turnEl.matches('[data-message-author-role]')) {
+        localRoleNodes.push(turnEl);
+      }
+      turnEl.querySelectorAll('[data-message-author-role]').forEach((roleEl) => {
+        const parentRole = roleEl.parentElement ? roleEl.parentElement.closest('[data-message-author-role]') : null;
+        if (parentRole) return;
+        localRoleNodes.push(roleEl);
+      });
+
+      if (localRoleNodes.length) {
+        const seen = new Set();
+        for (const roleEl of localRoleNodes) {
+          if (!roleEl || seen.has(roleEl)) continue;
+          seen.add(roleEl);
+          const text = extractTextForExport(roleEl);
+          if (!text) continue;
+          turns.push({
+            role: inferMessageRole(roleEl),
+            text
+          });
+        }
+        continue;
+      }
+
+      const text = extractTextForExport(turnEl);
+      if (!text) continue;
+      turns.push({
+        role: inferMessageRole(turnEl),
+        text
+      });
+    }
+    return turns;
+  }
+
+  function buildConversationExportPayload() {
+    const now = new Date();
+    const route = resolveConversationRouteInfo({
+      url: location.href,
+      fallbackPath: location.pathname || '/'
+    });
+    const title = resolveConversationTitle();
+    const turns = collectConversationExportTurns();
+    const text = buildConversationExportMarkdown({
+      title,
+      url: location.href,
+      exportedAtLocal: formatLocalTimestamp(now),
+      exportedAtIso: now.toISOString(),
+      scriptVersion: SCRIPT_VERSION,
+      turns
+    });
+    return {
+      now,
+      route,
+      title,
+      turns,
+      text
+    };
+  }
+
+  function exportConversationToFile(reason) {
+    const nodes = getMessageNodes();
+    const hasHardSlim = nodes.some((node) => !!(node && node.dataset && node.dataset.vsSlimmed));
+    if (hasHardSlim) unvirtualizeAll();
+    const payload = buildConversationExportPayload();
+    logEvent('info', 'chat.export', {
+      reason: reason || 'manual',
+      conversationId: payload.route.conversationId || '',
+      route: payload.route.pathname || '',
+      turns: payload.turns.length,
+      hardRestored: hasHardSlim
+    });
+    const titlePart = sanitizeFilenamePart(payload.title).slice(0, 36);
+    const stamp = formatFileTimestamp(payload.now);
+    const filename = titlePart
+      ? `cgpt-glass-conversation-${titlePart}-${stamp}.md`
+      : `cgpt-glass-conversation-${stamp}.md`;
+    downloadTextFile(filename, payload.text);
+    if (hasHardSlim && virtualizationEnabled && !ctrlFFreeze) {
+      setTimeout(() => scheduleVirtualize(), 160);
+    }
+    return payload.text;
+  }
+
   function buildLogExportText(reason) {
     const now = new Date();
     const nowMs = Date.now();
@@ -2262,14 +2694,31 @@ if (__CGPT_BROWSER__) {
     const marginOverrideRemainingMs = marginSnap.overrideUntil && (marginSnap.overrideUntil > nowMs)
       ? (marginSnap.overrideUntil - nowMs)
       : 0;
-    const optimizingNow = (() => {
-      if (!virtualizationEnabled || ctrlFFreeze || (autoPauseOnChat && chatBusy)) return false;
-      if (hardSliceState.active || optimizeState.active) return true;
-      if (optimizeState.lastWorkAt && (nowMs - optimizeState.lastWorkAt) < OPTIMIZE_HOLD_MS) return true;
-      if (optimizeBusyUntil && nowMs < optimizeBusyUntil) return true;
-      return false;
-    })();
+    const gateTurns = getTurnsCountCached(false) || state.turns || 0;
+    const gate = getOptimizeGateStatus(nowMs, gateTurns, state.domNodes, state.memMB);
+    const optimizingStatus = resolveOptimizingStatus({
+      virtualizationEnabled,
+      ctrlFFreeze,
+      autoPauseOnChat,
+      chatBusy,
+      gateReady: !!gate.ready,
+      hardSliceActive: !!hardSliceState.active,
+      optimizeActive: !!optimizeState.active,
+      lastWorkAt: optimizeState.lastWorkAt,
+      optimizeBusyUntil,
+      optimizeHoldMs: OPTIMIZE_HOLD_MS,
+      now: nowMs
+    });
+    const optimizingNow = !!optimizingStatus.optimizing;
     const entries = logBuffer.slice();
+    const route = resolveConversationRouteInfo({
+      url: state.url,
+      fallbackPath: location.pathname || '/'
+    });
+    const convTitle = resolveConversationTitle();
+    const turnNodes = getMessageNodes().length;
+    const scrollBottom = getScrollBottomGap();
+    const recentIssues = entries.filter((e) => e.level === 'warn' || e.level === 'error').slice(-12);
     const counts = {
       info: 0,
       warn: 0,
@@ -2298,80 +2747,206 @@ if (__CGPT_BROWSER__) {
     const overallSev = maxSeverity([memInfo.level, domInfo.level, serviceSev, ipSev, powSev, virtSev, pauseSev]);
     const firstEvent = entries.length ? entries[0].timestamp : '';
     const lastEvent = entries.length ? entries[entries.length - 1].timestamp : '';
+    const eventsRange = (firstEvent && lastEvent)
+      ? { first: firstEvent, last: lastEvent }
+      : null;
+    const recentIssueItems = recentIssues.map((e) => ({
+      timestamp: e.timestamp,
+      level: String(e.level || '').toLowerCase(),
+      event: e.event || e.message || 'unknown',
+      message: e.context && e.context.message ? String(e.context.message) : ''
+    }));
 
-    const lines = [];
-    lines.push('CGPT Glass Engine Log Export');
-    lines.push(`Generated: ${formatLocalTimestamp(now)} (${now.toISOString()})`);
-    lines.push(`SessionStart: ${formatLocalTimestamp(new Date(SESSION_STARTED_AT))} (${new Date(SESSION_STARTED_AT).toISOString()})`);
-    lines.push(`SessionAge: ${formatDurationMs(Date.now() - SESSION_STARTED_AT)}`);
-    lines.push('SessionScope: current page lifetime only (no persistence)');
-    if (reason) lines.push(`Reason: ${reason}`);
-    lines.push(`Version: ${state.version}`);
-    lines.push(`URL: ${state.url}`);
-    lines.push(`UserAgent: ${navigator.userAgent}`);
-    lines.push(`LogLevel: ${logLevel}`);
-    lines.push(`LogConsole: ${logToConsole ? 'on' : 'off'}`);
-    lines.push(`Entries: ${entries.length} (info:${counts.info} warn:${counts.warn} error:${counts.error} debug:${counts.debug})`);
-    if (firstEvent && lastEvent) lines.push(`EventsRange: ${firstEvent} -> ${lastEvent}`);
-    lines.push('');
-    lines.push('[LogSchema]');
-    lines.push(`schema_version=${LOG_SCHEMA_VERSION}`);
-    lines.push('format=json_line');
-    lines.push(`source=${LOG_SOURCE}`);
-    lines.push(`component=${LOG_COMPONENT}`);
-    lines.push(`session_id=${SESSION_ID}`);
-    lines.push(`host=${location.host || '--'}`);
-    lines.push(`tz_offset_min=${new Date().getTimezoneOffset()}`);
-    lines.push(`fields=${LOG_FIELD_ORDER.join(',')}`);
-    lines.push('');
-    lines.push('[Highlights]');
-    lines.push('Legend: [OK]=正常 [WARN]=存疑 [BAD]=异常 [SUSPECT]=数据缺失/过期');
-    lines.push(formatTaggedLine('Overall', overallSev, severityTag(overallSev), 'mem/dom/service/ip/pow/virt/pause'));
-    lines.push(formatTaggedLine('Memory', memInfo.level, memInfo.label));
-    lines.push(formatTaggedLine('DOM', domInfo.level, domInfo.label));
-    lines.push(formatTaggedLine('Service', serviceSev, `${serviceInfo.label} (${degradedState.service.indicator || '--'})`, serviceFresh ? 'fresh' : 'stale'));
-    lines.push(formatTaggedLine('IP', ipSev, `${degradedState.ip.masked || '--'} ${degradedState.ip.qualityLabel || ''}`.trim(), ipFresh ? 'fresh' : 'stale'));
-    lines.push(formatTaggedLine('PoW', powSev, `${degradedState.pow.difficulty || '--'} ${degradedState.pow.levelLabel || ''}`.trim(), powFresh ? 'fresh' : 'stale'));
-    lines.push(formatTaggedLine('Virtualization', virtSev, `${state.virtualizationEnabled ? 'on' : 'off'} (${state.virtualizationMode})`, state.paused ? `paused:${state.pausedReason || 'yes'}` : 'running'));
-    lines.push('');
-    lines.push('[State]');
-    lines.push(`mode=${state.mode} virt=${state.virtualizationEnabled ? 'on' : 'off'} soft=${useSoftVirtualization ? 'on' : 'off'} hardActive=${hardActive ? 'yes' : 'no'} hardSource=${state.hardActiveSource || 'n/a'}`);
-    lines.push(`paused=${state.paused ? (state.pausedReason || 'yes') : 'no'} autoPause=${state.autoPauseOnChat ? 'on' : 'off'} chatBusy=${state.chatBusy ? 'yes' : 'no'}`);
-    lines.push(`turns=${state.turns} virtualized=${state.virtualized}`);
-    lines.push(`domNodes=${state.domNodes} memMB=${state.memMB == null ? 'n/a' : state.memMB}`);
-    lines.push(`scrollY=${state.scrollY} viewportH=${state.viewportH} scrollRoot=${state.scrollRoot}`);
-    lines.push(`degraded=${state.degradedSeverity} service=${state.degradedServiceIndicator} (${state.degradedServiceDesc || '--'})`);
-    lines.push(`ip=${state.degradedIp || '--'} score=${state.degradedIpScore == null ? 'n/a' : state.degradedIpScore}`);
-    lines.push(`pow=${state.degradedPowDifficulty || '--'} (${state.degradedPowLevel || '--'})`);
-    lines.push('');
-    lines.push('[Instant]');
-    lines.push(`scroll.lastAt=${formatAge(lastScrollAt)} idleMs=${scrollIdleMs == null ? 'n/a' : Math.round(scrollIdleMs)} lastTop=${Math.round(lastScrollTop || 0)}`);
-    lines.push(`scroll.root=${describeEl(scrollRoot)} rootAt=${formatAge(scrollRootAt)} rootIsWindow=${scrollRootIsWindow ? 'yes' : 'no'} target=${describeEl(scrollTarget)}`);
-    lines.push(`hard.active=${hardActive ? 'yes' : 'no'} source=${hardActiveSource || 'n/a'} lastAutoHardAt=${formatAge(lastAutoHardAt)} autoHardBelowAt=${formatAge(autoHardBelowAt)}`);
-    lines.push(`hard.pass.lastAt=${formatAge(lastHardPassAt)} deferAt=${formatAge(hardScrollDeferAt)} deferAge=${hardDeferMs == null ? 'n/a' : formatDurationMs(hardDeferMs)} idleTimer=${hardScrollIdleTimer ? 'on' : 'off'}`);
-    lines.push(`hard.slice.active=${hardSliceState.active ? 'yes' : 'no'} steps=${hardSliceState.steps} index=${hardSliceState.index}/${hardSliceState.total} lastStepAt=${formatAge(hardSliceState.lastStepAt)} scrollTop=${Math.round(hardSliceState.scrollTop || 0)} viewportH=${Math.round(hardSliceState.viewportH || 0)}`);
-    lines.push(`soft.observed=${softObserved.size} slim=${softSlimCount} observerMargin=${softObserverMargin || '--'} observerRoot=${describeEl(softObserverRoot)}`);
-    lines.push(`soft.sync.pending=${softSyncPending ? 'yes' : 'no'} softTimer=${softSyncTimer ? 'on' : 'off'}`);
-    lines.push(`cache.msg.count=${msgCache.length} dirty=${msgCacheDirty ? 'yes' : 'no'} age=${msgCacheAt ? formatDurationMs(nowMs - msgCacheAt) : 'n/a'}`);
-    lines.push(`cache.turns.count=${turnsCountCache} age=${turnsCountAt ? formatDurationMs(nowMs - turnsCountAt) : 'n/a'} dom.age=${domCountAt ? formatDurationMs(nowMs - domCountAt) : 'n/a'}`);
-    lines.push(`opt.active=${optimizeState.active ? 'yes' : 'no'} optimizingNow=${optimizingNow ? 'yes' : 'no'} lastWorkAt=${formatAge(optimizeState.lastWorkAt)} busyUntil=${optimizeBusyUntil ? formatLocalTimestamp(new Date(optimizeBusyUntil)) : 'n/a'} busyRemaining=${formatDurationMs(busyRemainingMs)}`);
-    lines.push(`margins.soft=${marginSnap.soft} hard=${marginSnap.hard} desiredSoft=${marginSnap.desiredSoft} desiredHard=${marginSnap.desiredHard}`);
-    lines.push(`margins.autoHardDom=${marginSnap.autoHardDom} autoHardExit=${marginSnap.autoHardExit} override=${marginSnap.overrideUntil && nowMs < marginSnap.overrideUntil ? 'yes' : 'no'} overrideReason=${marginSnap.overrideReason || ''} overrideRemaining=${formatDurationMs(marginOverrideRemainingMs)}`);
-    lines.push('');
-    lines.push('[Events]');
-    if (!entries.length) {
-      lines.push('(empty)');
-    }
-    else {
-      entries.forEach((e) => lines.push(formatLogLine(e)));
-    }
-    return lines.join('\n');
+    const doc = buildStructuredLogExport({
+      schemaVersion: '2.0.0',
+      source: LOG_SOURCE,
+      component: LOG_COMPONENT,
+      generatedAtIso: now.toISOString(),
+      generatedAtLocal: formatLocalTimestamp(now),
+      reason: reason || '',
+      session: {
+        id: SESSION_ID,
+        started_at_iso: new Date(SESSION_STARTED_AT).toISOString(),
+        started_at_local: formatLocalTimestamp(new Date(SESSION_STARTED_AT)),
+        age: formatDurationMs(Date.now() - SESSION_STARTED_AT),
+        scope: 'current_page_lifetime',
+        version: state.version,
+        url: state.url,
+        host: location.host || '--',
+        user_agent: navigator.userAgent,
+        log_level: logLevel,
+        log_console: logToConsole ? 'on' : 'off',
+        entries: {
+          total: entries.length,
+          by_level: counts,
+          range: eventsRange
+        },
+        timezone_offset_min: new Date().getTimezoneOffset(),
+        event_fields: LOG_FIELD_ORDER.slice()
+      },
+      conversation: {
+        title: convTitle,
+        pathname: route.pathname,
+        route_key: route.routeKey,
+        conversation_id: route.conversationId || '',
+        is_conversation: !!route.isConversation,
+        turn_nodes: turnNodes
+      },
+      health: {
+        overall: overallSev,
+        memory: {
+          level: memInfo.level,
+          label: memInfo.label
+        },
+        dom: {
+          level: domInfo.level,
+          label: domInfo.label
+        },
+        service: {
+          level: serviceSev,
+          indicator: degradedState.service.indicator || '',
+          label: serviceInfo.label,
+          fresh: !!serviceFresh
+        },
+        ip: {
+          level: ipSev,
+          masked: degradedState.ip.masked || '--',
+          label: degradedState.ip.qualityLabel || '',
+          fresh: !!ipFresh
+        },
+        pow: {
+          level: powSev,
+          difficulty: degradedState.pow.difficulty || '',
+          label: degradedState.pow.levelLabel || '',
+          fresh: !!powFresh
+        },
+        virtualization: {
+          level: virtSev,
+          enabled: !!state.virtualizationEnabled,
+          mode: state.virtualizationMode
+        },
+        pause: {
+          level: pauseSev,
+          active: !!state.paused,
+          reason: state.pausedReason || ''
+        }
+      },
+      runtime: {
+        mode: state.mode,
+        virtualization_enabled: !!state.virtualizationEnabled,
+        soft_virtualization: !!useSoftVirtualization,
+        hard_active: !!hardActive,
+        hard_source: state.hardActiveSource || '',
+        paused: !!state.paused,
+        paused_reason: state.pausedReason || '',
+        auto_pause_on_chat: !!state.autoPauseOnChat,
+        chat_busy: !!state.chatBusy,
+        turns: state.turns,
+        virtualized: state.virtualized,
+        dom_nodes: state.domNodes,
+        memory_mb: state.memMB,
+        scroll: {
+          y: state.scrollY,
+          viewport_h: state.viewportH,
+          root: state.scrollRoot,
+          last_at: lastScrollAt || 0,
+          last_top: Math.round(lastScrollTop || 0),
+          idle_ms: scrollIdleMs,
+          bottom_gap: scrollBottom.gap
+        },
+        degraded: {
+          severity: state.degradedSeverity,
+          service_indicator: state.degradedServiceIndicator,
+          service_desc: state.degradedServiceDesc || '',
+          ip: state.degradedIp || '',
+          ip_score: state.degradedIpScore,
+          pow_difficulty: state.degradedPowDifficulty || '',
+          pow_level: state.degradedPowLevel || ''
+        },
+        optimize: {
+          gate_ready: !!gate.ready,
+          gate_load_ready: !!gate.loadReady,
+          gate_pressure_ready: !!gate.pressureReady,
+          gate_pressure_level: gate.pressureLevel || 'na',
+          active: !!optimizeState.active,
+          optimizing_now: optimizingNow,
+          last_work_at: optimizeState.lastWorkAt || 0,
+          busy_until: optimizingStatus.nextBusyUntil || 0,
+          busy_remaining_ms: busyRemainingMs
+        },
+        margins: {
+          soft: marginSnap.soft,
+          hard: marginSnap.hard,
+          desired_soft: marginSnap.desiredSoft,
+          desired_hard: marginSnap.desiredHard,
+          auto_hard_dom: marginSnap.autoHardDom,
+          auto_hard_exit: marginSnap.autoHardExit,
+          override: !!(marginSnap.overrideUntil && nowMs < marginSnap.overrideUntil),
+          override_reason: marginSnap.overrideReason || '',
+          override_remaining_ms: marginOverrideRemainingMs
+        },
+        cache: {
+          msg_count: msgCache.length,
+          msg_dirty: !!msgCacheDirty,
+          msg_age_ms: msgCacheAt ? Math.max(0, nowMs - msgCacheAt) : null,
+          turns_count: turnsCountCache,
+          turns_age_ms: turnsCountAt ? Math.max(0, nowMs - turnsCountAt) : null,
+          dom_age_ms: domCountAt ? Math.max(0, nowMs - domCountAt) : null
+        }
+      },
+      bugFocus: {
+        route_auto_scroll: {
+          last_at: lastRouteAutoScrollAt || 0,
+          timer_on: !!routeAutoScrollTimer,
+          min_interval_ms: ROUTE_AUTO_SCROLL_MIN_INTERVAL_MS,
+          delays_ms: ROUTE_AUTO_SCROLL_DELAYS_MS.slice()
+        },
+        observers: {
+          message_observer: !!msgObserver,
+          soft_observer: !!softObserver,
+          message_container: describeEl(msgContainer)
+        },
+        hard_slice: {
+          active: !!hardSliceState.active,
+          steps: hardSliceState.steps,
+          index: hardSliceState.index,
+          total: hardSliceState.total,
+          last_step_at: hardSliceState.lastStepAt || 0,
+          last_pass_at: lastHardPassAt || 0,
+          scroll_defer_at: hardScrollDeferAt || 0,
+          scroll_defer_ms: hardDeferMs
+        },
+        recent_issues: recentIssueItems,
+        capture_hint: [
+          "Reproduce once, then export logs.",
+          "If bug is hard to catch, run CGPT_VS.setLogLevel('debug') before reproducing."
+        ]
+      },
+      events: entries.map((e) => ({
+        timestamp: e.timestamp,
+        level: e.level,
+        message: e.message,
+        context: e.context ?? null,
+        severity: e.severity,
+        event: e.event,
+        event_id: e.eventId,
+        category: e.category,
+        outcome: e.outcome,
+        source: e.source,
+        component: e.component,
+        session_id: e.sessionId,
+        version: e.version,
+        seq: e.seq
+      }))
+    });
+    return JSON.stringify(doc, null, 2);
   }
 
-  function downloadTextFile(filename, text) {
+  function downloadTextFile(filename, text, contentType) {
     try {
       if (!document.body) throw new Error('document.body missing');
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const type = String(contentType || 'text/plain;charset=utf-8');
+      const blob = new Blob([text], { type });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -2393,8 +2968,8 @@ if (__CGPT_BROWSER__) {
   function exportLogsToFile(reason) {
     logEvent('info', 'log.export', { reason: reason || 'manual', count: logBuffer.length });
     const text = buildLogExportText(reason);
-    const filename = `cgpt-glass-log-${formatFileTimestamp(new Date())}.txt`;
-    downloadTextFile(filename, text);
+    const filename = `cgpt-glass-log-${formatFileTimestamp(new Date())}.json`;
+    downloadTextFile(filename, text, 'application/json;charset=utf-8');
     return text;
   }
 
@@ -3966,11 +4541,9 @@ if (__CGPT_BROWSER__) {
     const busy = autoPauseOnChat && updateChatBusy(false);
     if (busy) {
       softSyncDeferred = true;
-      setOptimizeActive(false);
       return;
     }
 
-    setOptimizeActive(true);
     const nodes = getMessageNodes();
     lastTurnsCount = nodes.length;
 
@@ -4006,7 +4579,6 @@ if (__CGPT_BROWSER__) {
         slim: softSlimCount
       });
     }
-    setOptimizeActive(false);
   }
 
   function scheduleSoftSync(reason) {
@@ -4412,7 +4984,6 @@ if (__CGPT_BROWSER__) {
 
   function shouldBypassOptimizeGate(now) {
     if (marginCache.overrideUntil && now < marginCache.overrideUntil) return true;
-    if (optimizeState.active) return true;
     return false;
   }
 
@@ -5393,7 +5964,7 @@ if (__CGPT_BROWSER__) {
       .concat(collectTopBarTextCandidates(mainLeft))
       .concat(collectModelLabelAnchors(mainLeft));
     let best = pickBestModelCandidate(candidates, mainLeft);
-    if (best) {
+    if (best && scoreModelCandidate(best, mainLeft) <= MODEL_CANDIDATE_MAX_SCORE) {
       modelBtnCache = { el: best, at: now };
       return best;
     }
@@ -5406,6 +5977,9 @@ if (__CGPT_BROWSER__) {
     for (const b of btns) {
       const txt = ((b.innerText || b.textContent || '')).trim();
       if (!txt) continue;
+      if (!isElementVisible(b)) continue;
+      const rect = b.getBoundingClientRect();
+      if (mainLeft && rect.right < (mainLeft - 6)) continue;
 
       const hit =
         /chatgpt/i.test(txt) ||
@@ -5418,36 +5992,170 @@ if (__CGPT_BROWSER__) {
     }
 
     best = pickBestModelCandidate(headerCandidates, mainLeft);
+    if (best && scoreModelCandidate(best, mainLeft) > MODEL_CANDIDATE_MAX_SCORE) best = null;
     modelBtnCache = { el: best || null, at: now };
     return best;
+  }
+
+  function findVoiceActionButton(mainLeft) {
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    const minTop = Math.round(window.innerHeight * FOLLOW_BOTTOM_ZONE_RATIO);
+    let best = null;
+    let bestScore = Infinity;
+    document.querySelectorAll('button, [role="button"]').forEach((el) => {
+      if (!isElementVisible(el)) return;
+      if (el.closest && el.closest('#' + ROOT_ID)) return;
+      if (el.closest && el.closest('nav, aside')) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.top < minTop) return;
+      if (ml && rect.right < (ml - 6)) return;
+      const label = getElementLabel(el);
+      if (!label) return;
+      if (!/(结束语音|语音结束|结束通话|结束|end voice|leave voice|hang up|\bend\b)/i.test(label)) return;
+      const score = Math.abs(window.innerHeight - rect.bottom) * 3 +
+        Math.abs((window.innerWidth - 120) - rect.right);
+      if (score < bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    });
+    return best;
+  }
+
+  function normalizeComposerAnchor(el) {
+    if (!el) return null;
+    const tag = (el.tagName || '').toLowerCase();
+    const editable = el.getAttribute && el.getAttribute('contenteditable');
+    if (tag === 'textarea' || tag === 'input' || editable === 'true') {
+      const host = el.closest('form, [data-testid*="composer"], [data-testid*="chat-input"], [data-testid*="message-composer"], [class*="composer"]');
+      return host || el;
+    }
+    return el;
+  }
+
+  function scoreComposerCandidate(el, mainLeft) {
+    if (!isElementVisible(el)) return Infinity;
+    const rect = el.getBoundingClientRect();
+    if (rect.top < (window.innerHeight * FOLLOW_BOTTOM_ZONE_RATIO)) return Infinity;
+    let score = Math.abs(window.innerHeight - rect.bottom) * 2 +
+      Math.abs(rect.left - Math.max(0, Number(mainLeft) || 0));
+    if (mainLeft && rect.right < (mainLeft - 6)) score += 1400;
+    if (rect.width < 220) score += 160;
+    if (rect.width > (window.innerWidth * 0.48)) score -= 80;
+    return score;
+  }
+
+  function findComposerAnchor(mainLeft) {
+    const ml = (typeof mainLeft === 'number') ? mainLeft : getMainContentLeft();
+    const selectors = [
+      '#prompt-textarea',
+      'textarea[data-testid*="prompt"]',
+      '[data-testid*="composer"] textarea',
+      '[data-testid*="chat-input"] textarea',
+      'main textarea',
+      'main [contenteditable="true"]',
+      '[data-testid*="composer"]',
+      '[data-testid*="chat-input"]',
+      '[data-testid*="message-composer"]',
+      'main form'
+    ];
+    const seen = new Set();
+    let best = null;
+    let bestScore = Infinity;
+    selectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((node) => {
+        const el = normalizeComposerAnchor(node);
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        if (el.closest && el.closest('#' + ROOT_ID)) return;
+        if (el.closest && el.closest('nav, aside')) return;
+        const score = scoreComposerCandidate(el, ml);
+        if (score < bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      });
+    });
+    return best;
+  }
+
+  function resolveFollowAnchor() {
+    const mainLeft = getMainContentLeft();
+    const modelButton = findModelButton();
+    if (modelButton) {
+      return {
+        element: modelButton,
+        kind: 'model',
+        mainLeft
+      };
+    }
+    const voiceButton = findVoiceActionButton(mainLeft);
+    if (voiceButton) {
+      return {
+        element: voiceButton,
+        kind: 'voice',
+        mainLeft
+      };
+    }
+    const composer = findComposerAnchor(mainLeft);
+    if (composer) {
+      return {
+        element: composer,
+        kind: 'composer',
+        mainLeft
+      };
+    }
+    return {
+      element: null,
+      kind: 'fallback',
+      mainLeft
+    };
   }
 
   function positionNearModelButton() {
     const root = ensureRoot();
     if (pinned) return;
 
-    const btn = findModelButton();
-    if (!btn) {
-      root.style.left = '12px';
-      root.style.top = `${10 + FLOAT_Y_OFFSET_PX}px`;
-      root.style.right = 'auto';
-      root.style.bottom = 'auto';
-      root.classList.add('fallback');
-      return;
-    }
-
-    const r = btn.getBoundingClientRect();
     const rootRect = root.getBoundingClientRect();
     const rootW = Math.max(200, Math.round(rootRect.width || 0));
     const rootH = Math.max(24, Math.round(rootRect.height || 0));
-    const gap = 8;
-    let x = Math.round(r.right + gap);
-    const leftX = Math.round(r.left - rootW - gap);
-    if ((x + rootW > window.innerWidth - 6) && leftX >= 6) {
-      x = leftX;
+    const anchor = resolveFollowAnchor();
+    if (!anchor.element) {
+      const fallbackX = anchor.mainLeft
+        ? Math.round(anchor.mainLeft + FOLLOW_ANCHOR_GAP_PX)
+        : 12;
+      root.style.left = `${clamp(fallbackX, 6, window.innerWidth - rootW - 6)}px`;
+      root.style.top = `${clamp(10 + FLOAT_Y_OFFSET_PX, 6, window.innerHeight - rootH - 6)}px`;
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+      root.classList.add('fallback');
+      root.setAttribute('data-follow-anchor', 'fallback');
+      return;
     }
-    const baseY = Math.round(r.top + (r.height - rootH) / 2);
-    const y = Math.max(6, baseY + FLOAT_Y_OFFSET_PX);
+
+    const r = anchor.element.getBoundingClientRect();
+    let x = 0;
+    let y = 0;
+    if (anchor.kind === 'model') {
+      x = Math.round(r.right + FOLLOW_ANCHOR_GAP_PX);
+      const leftX = Math.round(r.left - rootW - FOLLOW_ANCHOR_GAP_PX);
+      if ((x + rootW > window.innerWidth - 6) && leftX >= 6) {
+        x = leftX;
+      }
+      const baseY = Math.round(r.top + (r.height - rootH) / 2);
+      y = Math.max(6, baseY + FLOAT_Y_OFFSET_PX);
+    }
+    else {
+      const xPrimary = Math.round(r.left);
+      const xRightAligned = Math.round(r.right - rootW);
+      x = xPrimary;
+      if ((x + rootW > window.innerWidth - 6) && xRightAligned >= 6) {
+        x = xRightAligned;
+      }
+      const upY = Math.round(r.top - rootH - FOLLOW_ANCHOR_GAP_PX + FLOAT_Y_OFFSET_PX);
+      const downY = Math.round(r.bottom + FOLLOW_ANCHOR_GAP_PX + FLOAT_Y_OFFSET_PX);
+      y = (upY >= 6) ? upY : downY;
+    }
 
     root.style.left = `${clamp(x, 6, window.innerWidth - rootW - 6)}px`;
     root.style.top = `${clamp(y, 6, window.innerHeight - rootH - 6)}px`;
@@ -5455,6 +6163,7 @@ if (__CGPT_BROWSER__) {
     root.style.bottom = 'auto';
 
     root.classList.remove('fallback');
+    root.setAttribute('data-follow-anchor', anchor.kind);
   }
 
   function startFollowPositionLoop() {
@@ -5572,6 +6281,15 @@ if (__CGPT_BROWSER__) {
         --cgpt-glass-shadow: 0 22px 60px rgba(15,23,42,0.16);
         --cgpt-glass-shadow-soft: 0 12px 28px rgba(15,23,42,0.08);
         --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.86);
+        --cgpt-vs-radius-panel: 16px;
+        --cgpt-vs-radius-card: 14px;
+        --cgpt-vs-radius-pill: 999px;
+        --cgpt-vs-control-h-mini: 18px;
+        --cgpt-vs-control-h-tag: 22px;
+        --cgpt-vs-control-h-seg: 28px;
+        --cgpt-vs-control-h-chip: 30px;
+        --cgpt-vs-ease-fast: 170ms cubic-bezier(0.22, 0.82, 0.28, 1);
+        --cgpt-vs-focus-ring: 0 0 0 2px rgba(16,185,129,0.32), 0 0 0 4px rgba(16,185,129,0.14);
         transform: translateZ(0);
         opacity: 1;
         transition: opacity 160ms ease;
@@ -5588,9 +6306,9 @@ if (__CGPT_BROWSER__) {
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        height: 28px;
+        height: var(--cgpt-vs-control-h-chip);
         padding: 0 10px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid var(--cgpt-glass-border);
         background: var(--cgpt-glass-chip);
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
@@ -5601,6 +6319,19 @@ if (__CGPT_BROWSER__) {
         color: rgba(0,0,0,0.78);
       }
       #${BTN_ID}:hover{ background: rgba(255,255,255,0.92); }
+      #${ROOT_ID} button,
+      #${BTN_ID}{
+        transition: background var(--cgpt-vs-ease-fast), border-color var(--cgpt-vs-ease-fast), color var(--cgpt-vs-ease-fast), box-shadow var(--cgpt-vs-ease-fast), transform 120ms ease;
+      }
+      #${ROOT_ID} button:focus-visible,
+      #${BTN_ID}:focus-visible{
+        outline: none;
+        box-shadow: var(--cgpt-vs-focus-ring), var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID} button:active,
+      #${BTN_ID}:active{
+        transform: translateY(1px);
+      }
       #${STATUS_TEXT_ID}{
         max-width: 220px;
         white-space: nowrap;
@@ -5617,9 +6348,9 @@ if (__CGPT_BROWSER__) {
       #${BTN_ID} .cgpt-vs-miniItem{
         position: relative;
         min-width: 24px;
-        height: 18px;
+        height: var(--cgpt-vs-control-h-mini);
         padding: 0 6px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid rgba(255,255,255,0.7);
         background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
         display:inline-flex;
@@ -5747,7 +6478,7 @@ if (__CGPT_BROWSER__) {
         width: 640px;
         max-width: min(720px, calc(100vw - 16px));
         padding: 12px;
-        border-radius: 16px;
+        border-radius: var(--cgpt-vs-radius-panel);
         border: 1px solid var(--cgpt-glass-border-strong);
         background: linear-gradient(135deg, var(--cgpt-glass-panel), var(--cgpt-glass-panel-2));
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
@@ -5847,7 +6578,7 @@ if (__CGPT_BROWSER__) {
       .cgpt-vs-organism{
         margin-top: 8px;
         padding: 10px;
-        border-radius: 14px;
+        border-radius: var(--cgpt-vs-radius-card);
         border: 1px solid var(--cgpt-glass-border-strong);
         background: linear-gradient(145deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
@@ -5903,6 +6634,35 @@ if (__CGPT_BROWSER__) {
         .cgpt-vs-layout{
           grid-template-columns: 1fr;
         }
+        .cgpt-vs-chip{
+          height: calc(var(--cgpt-vs-control-h-chip) + 4px);
+          padding: 0 12px;
+        }
+        .cgpt-vs-seg button{
+          height: calc(var(--cgpt-vs-control-h-seg) + 4px);
+        }
+        .cgpt-vs-chiprow{
+          width: 100%;
+          gap: 6px;
+        }
+        .cgpt-vs-chippair{
+          width: 100%;
+          display: flex;
+          flex-wrap: wrap;
+          white-space: normal;
+          gap: 6px;
+        }
+        .cgpt-vs-chippair .cgpt-vs-chip{
+          flex: 1 1 calc(50% - 3px);
+          min-width: 118px;
+        }
+        .cgpt-vs-topTags{
+          width: 100%;
+          justify-content: flex-start;
+        }
+        .cgpt-vs-topTag{
+          max-width: 100%;
+        }
       }
       .cgpt-vs-org-status{ padding-bottom: 8px; }
       .cgpt-vs-statusBar{
@@ -5932,11 +6692,13 @@ if (__CGPT_BROWSER__) {
         gap:6px;
         flex-wrap: wrap;
         justify-content:flex-end;
+        min-width: 0;
+        flex: 1 1 auto;
       }
       .cgpt-vs-topTag{
-        height: 22px;
+        height: var(--cgpt-vs-control-h-tag);
         padding: 0 8px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid var(--cgpt-glass-border);
         background: linear-gradient(140deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
         display:inline-flex;
@@ -5947,6 +6709,11 @@ if (__CGPT_BROWSER__) {
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
         -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
         box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+        min-width: 0;
+        max-width: min(190px, 100%);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       .cgpt-vs-topTag.pause{
         border-color: rgba(245,158,11,0.6);
@@ -5967,7 +6734,7 @@ if (__CGPT_BROWSER__) {
         width: 100%;
         padding: 4px;
         gap: 4px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         background: linear-gradient(150deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
         border: 1px solid rgba(255,255,255,0.75);
         box-shadow:
@@ -5979,10 +6746,10 @@ if (__CGPT_BROWSER__) {
       }
       .cgpt-vs-seg button{
         flex:1;
-        height: 28px;
+        height: var(--cgpt-vs-control-h-seg);
         border: 1px solid rgba(255,255,255,0.5);
         background: linear-gradient(160deg, rgba(255,255,255,0.58), rgba(255,255,255,0.22));
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         cursor: pointer;
         font-size: 12px;
         color: rgba(0,0,0,0.7);
@@ -6031,17 +6798,22 @@ if (__CGPT_BROWSER__) {
         white-space: nowrap;
       }
       .cgpt-vs-chip{
-        height: 28px;
+        height: var(--cgpt-vs-control-h-chip);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         padding: 0 10px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid var(--cgpt-glass-border);
         background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
         cursor: pointer;
         font-size: 12px;
+        font-weight: 600;
         color: rgba(0,0,0,0.78);
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
         -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
         box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+        transition: background var(--cgpt-vs-ease-fast), border-color var(--cgpt-vs-ease-fast), color var(--cgpt-vs-ease-fast), box-shadow var(--cgpt-vs-ease-fast), transform 120ms ease;
       }
       .cgpt-vs-chip:hover{ background: linear-gradient(145deg, rgba(255,255,255,0.94), rgba(255,255,255,0.7)); }
       .cgpt-vs-chip.primary{
@@ -6069,6 +6841,16 @@ if (__CGPT_BROWSER__) {
         box-shadow: 0 12px 24px rgba(245,158,11,0.2), inset 0 1px 0 rgba(255,255,255,0.45);
         font-weight: 800;
       }
+      #${ROOT_ID} #cgpt-vs-pin{
+        min-width: 64px;
+      }
+      #${ROOT_ID} #cgpt-vs-pin.is-pinned{
+        border-color: rgba(16,185,129,0.62);
+        background: linear-gradient(145deg, rgba(16,185,129,0.3), rgba(16,185,129,0.14));
+        color: #065f46;
+        box-shadow: 0 12px 24px rgba(16,185,129,0.22), inset 0 1px 0 rgba(255,255,255,0.5);
+        font-weight: 700;
+      }
       .cgpt-vs-chip-ghost{
         background: transparent;
         border-style: dashed;
@@ -6076,10 +6858,18 @@ if (__CGPT_BROWSER__) {
         color: rgba(0,0,0,0.64);
       }
       .cgpt-vs-chip-ghost:hover{ background: rgba(0,0,0,0.05); }
+      @media (prefers-reduced-motion: reduce){
+        #${ROOT_ID} *,
+        #${HELP_ID} *{
+          animation-duration: 1ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 1ms !important;
+        }
+      }
 
       .cgpt-vs-deg{
         padding: 10px;
-        border-radius: 14px;
+        border-radius: var(--cgpt-vs-radius-card);
         border: 1px solid var(--cgpt-glass-border-strong);
         background: linear-gradient(145deg, var(--cgpt-glass-card), var(--cgpt-glass-card-2));
         backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
@@ -6136,9 +6926,9 @@ if (__CGPT_BROWSER__) {
         position: relative;
         display:inline-flex;
         align-items:center;
-        height: 22px;
+        height: var(--cgpt-vs-control-h-tag);
         padding: 0 8px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid rgba(255,255,255,0.7);
         background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
         color: rgba(0,0,0,0.72);
@@ -6299,9 +7089,9 @@ if (__CGPT_BROWSER__) {
         position: relative;
         display:inline-flex;
         align-items:center;
-        height: 18px;
+        height: var(--cgpt-vs-control-h-mini);
         padding: 0 8px;
-        border-radius: 999px;
+        border-radius: var(--cgpt-vs-radius-pill);
         border: 1px solid rgba(255,255,255,0.7);
         background: linear-gradient(140deg, rgba(255,255,255,0.92), rgba(255,255,255,0.62));
         color: rgba(0,0,0,0.72);
@@ -6385,15 +7175,45 @@ if (__CGPT_BROWSER__) {
         margin-top: 8px;
         display:flex;
         align-items:center;
-        justify-content:space-between;
+        justify-content:flex-start;
         gap:8px;
         flex-wrap: wrap;
         width: 100%;
       }
       #${FP_ID} .fp-token{
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        height: var(--cgpt-vs-control-h-chip);
+        padding: 0 10px;
+        border-radius: var(--cgpt-vs-radius-pill);
+        border: 1px solid var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        color: rgba(0,0,0,0.78);
+        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
         font-size: 12px;
-        color: rgba(0,0,0,0.66);
-        padding: 0 2px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      #${FP_ID} .fp-token-label{
+        color: rgba(0,0,0,0.62);
+        font-weight: 600;
+      }
+      #${FP_ID} .fp-token-value{
+        min-width: 40px;
+        height: 20px;
+        padding: 0 8px;
+        border-radius: var(--cgpt-vs-radius-pill);
+        border: 1px solid rgba(16,185,129,0.55);
+        background: linear-gradient(140deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08));
+        color: #065f46;
+        font-weight: 800;
+        font-variant-numeric: tabular-nums;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
       }
 
       #${HELP_ID}{
@@ -6449,6 +7269,7 @@ if (__CGPT_BROWSER__) {
         --cgpt-glass-shadow: 0 22px 60px rgba(0,0,0,0.62);
         --cgpt-glass-shadow-soft: 0 14px 30px rgba(0,0,0,0.42);
         --cgpt-glass-inset: inset 0 1px 0 rgba(255,255,255,0.12);
+        --cgpt-vs-focus-ring: 0 0 0 2px rgba(52,211,153,0.42), 0 0 0 4px rgba(16,185,129,0.22);
       }
       #${ROOT_ID}.theme-dark #${BTN_ID}{
         border-color: var(--cgpt-glass-border);
@@ -6622,6 +7443,12 @@ if (__CGPT_BROWSER__) {
         color: #fde68a;
         box-shadow: 0 14px 28px rgba(251,191,36,0.28), inset 0 1px 0 rgba(255,255,255,0.12);
       }
+      #${ROOT_ID}.theme-dark #cgpt-vs-pin.is-pinned{
+        border-color: rgba(52,211,153,0.62);
+        background: linear-gradient(145deg, rgba(16,185,129,0.34), rgba(16,185,129,0.18));
+        color: #d1fae5;
+        box-shadow: 0 14px 28px rgba(16,185,129,0.3), inset 0 1px 0 rgba(255,255,255,0.12);
+      }
       #${ROOT_ID}.theme-dark .cgpt-vs-chip-ghost{
         background: rgba(255,255,255,0.04);
         border-color: rgba(255,255,255,0.2);
@@ -6670,7 +7497,18 @@ if (__CGPT_BROWSER__) {
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-link{ color: rgba(147,197,253,0.98); }
       #${ROOT_ID}.theme-dark #${FP_ID} .fp-token{
-        color: rgba(255,255,255,0.7);
+        border-color: var(--cgpt-glass-border);
+        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
+        color: rgba(255,255,255,0.9);
+        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
+      }
+      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token-label{
+        color: rgba(255,255,255,0.72);
+      }
+      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token-value{
+        border-color: rgba(52,211,153,0.62);
+        background: linear-gradient(140deg, rgba(16,185,129,0.34), rgba(16,185,129,0.16));
+        color: #d1fae5;
       }
       #${ROOT_ID}.theme-dark .mem-ok{ color:#4ade80; }
       #${ROOT_ID}.theme-dark .mem-warn{ color:#fbbf24; }
@@ -6830,6 +7668,7 @@ if (__CGPT_BROWSER__) {
       newChatBtn: root.querySelector('#cgpt-vs-newChat'),
       autoPauseBtn: root.querySelector('#' + AUTO_PAUSE_BTN_ID),
       scrollLatestBtn: root.querySelector('#' + SCROLL_LATEST_BTN_ID),
+      chatExportBtn: root.querySelector('#' + CHAT_EXPORT_BTN_ID),
       logExportBtn: root.querySelector('#' + LOG_EXPORT_BTN_ID),
       pauseTag: root.querySelector('#' + TOP_PAUSE_TAG_ID),
       optTag: root.querySelector('#' + TOP_OPT_TAG_ID),
@@ -6871,6 +7710,35 @@ if (__CGPT_BROWSER__) {
     return uiRefs;
   }
 
+  function getPinButtonMeta(isPinned) {
+    if (lang === 'zh') {
+      if (isPinned) {
+        return {
+          label: '已钉住',
+          title: '已钉住（可拖动）；点击切换为自动贴合',
+          aria: '已钉住，点击取消钉住并恢复自动贴合'
+        };
+      }
+      return {
+        label: '未钉住',
+        title: '未钉住（自动贴合）；点击钉住后可拖动',
+        aria: '未钉住，点击钉住并启用拖动'
+      };
+    }
+    if (isPinned) {
+      return {
+        label: 'Pinned',
+        title: 'Pinned (draggable). Click to switch back to auto follow.',
+        aria: 'Pinned. Click to unpin and restore auto follow.'
+      };
+    }
+    return {
+      label: 'Unpinned',
+      title: 'Unpinned (auto follow). Click to pin and drag manually.',
+      aria: 'Unpinned. Click to pin and drag manually.'
+    };
+  }
+
   // ========================== UI：构建 Root ==========================
   function ensureRoot() {
     injectStyles();
@@ -6887,6 +7755,7 @@ if (__CGPT_BROWSER__) {
     root.id = ROOT_ID;
     root.classList.add('booting');
     logEvent('info', 'ui.createRoot');
+    const pinMeta = getPinButtonMeta(pinned);
 
     root.innerHTML = `
       <div id="${BTN_ID}" class="cgpt-vs-atom cgpt-vs-btn" role="button" tabindex="0" aria-label="ChatGPT Virtual Scroll Engine">
@@ -6955,9 +7824,10 @@ if (__CGPT_BROWSER__) {
                       <button class="cgpt-vs-chip cgpt-vs-atom primary" id="cgpt-vs-toggle">--</button>
                       <button class="cgpt-vs-chip cgpt-vs-atom" id="${OPTIMIZE_BTN_ID}" title="${t('optimizeSoftTip')}">${t('optimizeSoft')}</button>
                       <button class="cgpt-vs-chip cgpt-vs-atom" id="${SCROLL_LATEST_BTN_ID}" title="${t('scrollLatestTip')}">${t('scrollLatest')}</button>
-                    </div>
-                    <div class="cgpt-vs-chiprow cgpt-vs-molecule">
-                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-newChat">${t('newChat')}</button>
+                      <span class="cgpt-vs-chippair">
+                        <button class="cgpt-vs-chip cgpt-vs-atom" id="${CHAT_EXPORT_BTN_ID}" title="${t('chatExportTip')}">${t('chatExport')}</button>
+                        <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-newChat">${t('newChat')}</button>
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -6967,8 +7837,8 @@ if (__CGPT_BROWSER__) {
                   <div class="cgpt-vs-controls cgpt-vs-flags">
                     <div class="cgpt-vs-chiprow cgpt-vs-molecule">
                       <button class="cgpt-vs-chip cgpt-vs-atom" id="${AUTO_PAUSE_BTN_ID}" title="${t('autoPauseTip')}">--</button>
-                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-pin">📌</button>
-                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-helpBtn">?</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-pin" title="${pinMeta.title}" aria-label="${pinMeta.aria}" aria-pressed="${pinned ? 'true' : 'false'}">${pinMeta.label}</button>
+                      <button class="cgpt-vs-chip cgpt-vs-atom" id="cgpt-vs-helpBtn" title="${t('help')}" aria-label="${t('help')}">${t('help')}</button>
                       <span class="cgpt-vs-chippair">
                         <button class="cgpt-vs-chip cgpt-vs-atom" id="${LOG_EXPORT_BTN_ID}" title="${t('logExportTip')}">${t('logExport')}</button>
                         <button class="cgpt-vs-chip cgpt-vs-atom" id="${DEG_REFRESH_BTN_ID}" title="${t('monitorRefreshTip')}">${t('monitorRefresh')}</button>
@@ -7083,10 +7953,22 @@ if (__CGPT_BROWSER__) {
 
     const token = document.createElement('span');
     token.className = 'fp-token';
+    const tokenLabel = document.createElement('span');
+    tokenLabel.className = 'fp-token-label';
+    const tokenValue = document.createElement('span');
+    tokenValue.className = 'fp-token-value';
+    token.append(tokenLabel, tokenValue);
     slot.append(token);
 
     // token 更新
-    token.textContent = `${t('token')}: ${tokenState.value || 0}`;
+    const setTokenView = (value) => {
+      const numeric = Number(value);
+      const display = Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
+      tokenLabel.textContent = t('token');
+      tokenValue.textContent = String(display);
+      token.setAttribute('aria-label', `${t('token')}: ${display}`);
+    };
+    setTokenView(tokenState.value || 0);
     const tick = () => {
       if (instance !== tokenState.instance) return;
       if (!document.body.contains(token)) return;
@@ -7109,7 +7991,7 @@ if (__CGPT_BROWSER__) {
           }
           const value = estimateTokens();
           tokenState.value = value;
-          token.textContent = `${t('token')}: ${value}`;
+          setTokenView(value);
           tokenState.pending = false;
           tokenState.nextAt = Date.now() + TOKEN_UPDATE_MIN_MS;
         };
@@ -7167,6 +8049,7 @@ if (__CGPT_BROWSER__) {
     const newChatBtn = refs ? refs.newChatBtn : root.querySelector('#cgpt-vs-newChat');
     const autoPauseBtn = refs ? refs.autoPauseBtn : root.querySelector('#' + AUTO_PAUSE_BTN_ID);
     const scrollLatestBtn = refs ? refs.scrollLatestBtn : root.querySelector('#' + SCROLL_LATEST_BTN_ID);
+    const chatExportBtn = refs ? refs.chatExportBtn : root.querySelector('#' + CHAT_EXPORT_BTN_ID);
     const logExportBtn = refs ? refs.logExportBtn : root.querySelector('#' + LOG_EXPORT_BTN_ID);
     if (!btn || !panel || !toggleBtn || !pinBtn || !newChatBtn) return;
 
@@ -7234,6 +8117,12 @@ if (__CGPT_BROWSER__) {
     bindHelpUI(root, help);
 
     pinBtn.addEventListener('click', () => {
+      if (!pinned) {
+        const rect = root.getBoundingClientRect();
+        pinnedPos.x = clamp(Math.round(rect.left), 0, window.innerWidth - 40);
+        pinnedPos.y = clamp(Math.round(rect.top), 0, window.innerHeight - 40);
+        savePos();
+      }
       pinned = !pinned;
       saveBool(KEY_PINNED, pinned);
       applyPinnedState();
@@ -7246,6 +8135,17 @@ if (__CGPT_BROWSER__) {
     if (autoPauseBtn) {
       autoPauseBtn.addEventListener('click', () => {
         setChatPause(!autoPauseOnChat);
+      });
+    }
+
+    if (chatExportBtn) {
+      chatExportBtn.addEventListener('click', () => {
+        const prev = chatExportBtn.textContent;
+        exportConversationToFile('ui');
+        chatExportBtn.textContent = t('chatExported');
+        setTimeout(() => {
+          chatExportBtn.textContent = prev;
+        }, 1200);
       });
     }
 
@@ -7304,8 +8204,16 @@ if (__CGPT_BROWSER__) {
 
     if (pinned) {
       stopFollowPositionLoop();
-      root.style.left = `${clamp(pinnedPos.x, 0, window.innerWidth - 60)}px`;
-      root.style.top = `${clamp(pinnedPos.y, 0, window.innerHeight - 60)}px`;
+      const rect = root.getBoundingClientRect();
+      const maxX = Math.max(0, window.innerWidth - Math.max(40, Math.round(rect.width || 0)));
+      const maxY = Math.max(0, window.innerHeight - Math.max(40, Math.round(rect.height || 0)));
+      const x = clamp(Math.round(Number(pinnedPos.x) || 0), 0, maxX);
+      const y = clamp(Math.round(Number(pinnedPos.y) || 0), 0, maxY);
+      pinnedPos.x = x;
+      pinnedPos.y = y;
+      savePos();
+      root.style.left = `${x}px`;
+      root.style.top = `${y}px`;
       root.style.right = 'auto';
       root.style.bottom = 'auto';
     }
@@ -7384,29 +8292,133 @@ if (__CGPT_BROWSER__) {
     }, 140);
   }
 
-  function scrollToLatest() {
-    const info = getScrollMetrics();
-    const smoothScroll = (target, top) => {
-      try {
-        target.scrollTo({ top, behavior: 'smooth' });
+  function scrollToLatest(options) {
+    const opts = (options && typeof options === 'object') ? options : {};
+    const behavior = opts.behavior === 'auto' ? 'auto' : 'smooth';
+    const retries = clamp(Math.round(Number(opts.retries) || 0), 0, 6);
+    const retryDelayMs = clamp(Math.round(Number(opts.retryDelayMs) || 220), 80, 2000);
+
+    const doScroll = () => {
+      const info = getScrollMetrics();
+      const runScroll = (target, top) => {
+        try {
+          target.scrollTo({ top, behavior });
+        }
+        catch {
+          target.scrollTo(0, top);
+        }
+      };
+
+      if (info.isWindow) {
+        const doc = document.scrollingElement || document.documentElement || document.body;
+        const top = Math.max(0, (doc.scrollHeight || 0) - window.innerHeight);
+        runScroll(window, top);
       }
-      catch {
-        target.scrollTo(0, top);
+      else if (info.root) {
+        const rootEl = info.root;
+        const top = Math.max(0, (rootEl.scrollHeight || 0) - (rootEl.clientHeight || 0));
+        runScroll(rootEl, top);
       }
+
+      setTimeout(() => scheduleVirtualize(), 160);
     };
 
-    if (info.isWindow) {
-      const doc = document.scrollingElement || document.documentElement || document.body;
-      const top = Math.max(0, (doc.scrollHeight || 0) - window.innerHeight);
-      smoothScroll(window, top);
+    const runWithRetry = (attempt) => {
+      doScroll();
+      if (attempt >= retries) return;
+      setTimeout(() => {
+        const gap = getScrollBottomGap().gap;
+        if (gap > 28) runWithRetry(attempt + 1);
+      }, retryDelayMs);
+    };
+
+    runWithRetry(0);
+  }
+
+  function clearRouteAutoScrollTimer() {
+    if (!routeAutoScrollTimer) return;
+    clearTimeout(routeAutoScrollTimer);
+    routeAutoScrollTimer = 0;
+  }
+
+  function scheduleRouteAutoScroll(reason) {
+    clearRouteAutoScrollTimer();
+    const trackKey = lastRouteKey;
+    const delays = ROUTE_AUTO_SCROLL_DELAYS_MS.slice();
+    const trigger = () => {
+      if (trackKey && trackKey !== lastRouteKey) return;
+      scrollToLatest({
+        behavior: 'auto',
+        retries: 1,
+        retryDelayMs: 220
+      });
+      lastRouteAutoScrollAt = Date.now();
+    };
+
+    trigger();
+    if (!delays.length) return;
+
+    let idx = 0;
+    const tick = () => {
+      if (idx >= delays.length) {
+        routeAutoScrollTimer = 0;
+        return;
+      }
+      const delay = Math.max(0, Number(delays[idx]) || 0);
+      idx += 1;
+      routeAutoScrollTimer = setTimeout(() => {
+        routeAutoScrollTimer = 0;
+        trigger();
+        tick();
+      }, delay);
+    };
+    tick();
+    logEvent('info', 'route.autoScroll', {
+      reason: reason || 'route',
+      routeKey: lastRouteKey || '',
+      delays: ROUTE_AUTO_SCROLL_DELAYS_MS.join(',')
+    });
+  }
+
+  function inspectRouteForAutoScroll(force) {
+    const route = resolveConversationRouteInfo({
+      url: location.href,
+      fallbackPath: location.pathname || '/'
+    });
+    const decision = resolveRouteAutoScrollDecision({
+      previousRouteKey: lastRouteKey,
+      nextRouteKey: route.routeKey,
+      now: Date.now(),
+      lastAutoScrollAt: lastRouteAutoScrollAt,
+      minIntervalMs: ROUTE_AUTO_SCROLL_MIN_INTERVAL_MS
+    });
+
+    if (decision.changed) {
+      logEvent('info', 'route.change', {
+        from: lastRouteKey || '',
+        to: route.routeKey || '',
+        conversationId: route.conversationId || ''
+      });
+      lastRouteKey = decision.routeKey;
+      reclaimRuntimeCaches('route-change', {
+        releaseNodeRefs: true,
+        resetSoftObservers: true,
+        resetMsgObserver: true
+      });
+      scrollRootAt = 0;
+      installScrollHook();
     }
-    else if (info.root) {
-      const rootEl = info.root;
-      const top = Math.max(0, (rootEl.scrollHeight || 0) - (rootEl.clientHeight || 0));
-      smoothScroll(rootEl, top);
+    else if (!lastRouteKey && route.routeKey) {
+      lastRouteKey = route.routeKey;
     }
 
-    setTimeout(() => scheduleVirtualize(), 160);
+    if (!route.isConversation) {
+      clearRouteAutoScrollTimer();
+      return;
+    }
+    if (force || decision.shouldAutoScroll) {
+      scheduleRouteAutoScroll(force ? 'force' : 'route-change');
+    }
   }
 
   function tryClickNewChat() {
@@ -7961,7 +8973,14 @@ if (__CGPT_BROWSER__) {
     }
 
     const pinBtn = refs ? refs.pinBtn : root.querySelector('#cgpt-vs-pin');
-    if (pinBtn) pinBtn.textContent = pinned ? (lang === 'zh' ? '📌已钉' : '📌Pinned') : (lang === 'zh' ? '📌钉住' : '📌Pin');
+    if (pinBtn) {
+      const pinMeta = getPinButtonMeta(pinned);
+      pinBtn.textContent = pinMeta.label;
+      pinBtn.title = pinMeta.title;
+      pinBtn.setAttribute('aria-label', pinMeta.aria);
+      pinBtn.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+      pinBtn.classList.toggle('is-pinned', pinned);
+    }
 
     const optimizeBtn = refs ? refs.optimizeBtn : root.querySelector('#' + OPTIMIZE_BTN_ID);
     if (optimizeBtn) {
@@ -7985,6 +9004,12 @@ if (__CGPT_BROWSER__) {
     if (logExportBtn) {
       logExportBtn.textContent = t('logExport');
       logExportBtn.title = t('logExportTip');
+    }
+
+    const chatExportBtn = refs ? refs.chatExportBtn : root.querySelector('#' + CHAT_EXPORT_BTN_ID);
+    if (chatExportBtn) {
+      chatExportBtn.textContent = t('chatExport');
+      chatExportBtn.title = t('chatExportTip');
     }
 
     const latestBtn = refs ? refs.scrollLatestBtn : root.querySelector('#' + SCROLL_LATEST_BTN_ID);
@@ -8043,6 +9068,11 @@ if (__CGPT_BROWSER__) {
       if (!root || !document.body.contains(root)) {
         try {
           uiRefs = null;
+          reclaimRuntimeCaches('route-rebuild', {
+            releaseNodeRefs: true,
+            resetSoftObservers: true,
+            resetMsgObserver: true
+          });
           logEvent('warn', 'route.rebuild', {
             reason: !root ? 'missing' : 'detached'
           });
@@ -8052,6 +9082,7 @@ if (__CGPT_BROWSER__) {
           scheduleVirtualize();
           if (pinned) stopFollowPositionLoop();
           else startFollowPositionLoop();
+          inspectRouteForAutoScroll(false);
         }
         catch {}
       }
@@ -8062,6 +9093,7 @@ if (__CGPT_BROWSER__) {
         renderFeaturePack(false);
         ensureThemeObservation();
         installScrollHook();
+        inspectRouteForAutoScroll(false);
       }
     }, ROUTE_GUARD_MS);
   }
@@ -8071,6 +9103,7 @@ if (__CGPT_BROWSER__) {
     PAGE_WIN.CGPT_VS = PAGE_WIN.CGPT_VS || {};
     PAGE_WIN.CGPT_VS.dump = dumpLogs;
     PAGE_WIN.CGPT_VS.exportLogs = exportLogsToFile;
+    PAGE_WIN.CGPT_VS.exportConversation = exportConversationToFile;
     PAGE_WIN.CGPT_VS.setLogLevel = setLogLevel;
     PAGE_WIN.CGPT_VS.setLogConsole = setLogConsole;
     PAGE_WIN.CGPT_VS.getState = getStateSnapshot;
@@ -8098,6 +9131,7 @@ if (__CGPT_BROWSER__) {
     if (!degradedState.ip.historyTooltip) updateIpHistoryTooltip();
 
     ensureRoot();
+    inspectRouteForAutoScroll(true);
     startThemeObserver();
     startDegradedMonitors();
     applyPinnedState();
