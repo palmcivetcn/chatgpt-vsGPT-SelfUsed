@@ -2,7 +2,7 @@
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
 // @version      1.2.5
-// @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复 + Token估算
+// @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
 // @updateURL    https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
@@ -404,8 +404,6 @@ if (__CGPT_BROWSER__) {
     }
   })();
   const DOM_COUNT_TTL_MS = 4000;
-  const TOKEN_UPDATE_MIN_MS = 5000;
-  const TOKEN_UPDATE_MAX_MS = 18000;
   const CHAT_BUSY_TTL_MS = 900;
   const CHAT_BUSY_MAX_SCAN = 80;
   const CHAT_BUSY_GRACE_MS = 2600;
@@ -550,13 +548,11 @@ if (__CGPT_BROWSER__) {
   const MOOD_CACHE_ATTEMPT_KEY = 'cgpt_glass_mood_attempt';
   // endregion: Tunables & Constants
 
-  // ========================== Feature Pack（Token） ==========================
   // region: I18N & Labels
   const lang = 'zh';
 
   const I18N = {
     zh: {
-      token: 'Token 估算',
       optimizeSoft: '优化',
       optimizeSoftTip: '自动优化：根据负载规划软/硬与屏数',
       optimizeStandby: '未达阈值，待优化',
@@ -614,7 +610,6 @@ if (__CGPT_BROWSER__) {
       riskUnknown: '未知'
     },
     en: {
-      token: 'Token Estimate',
       optimizeSoft: 'Optimize',
       optimizeSoftTip: 'Auto optimize: plan soft/hard and screen ranges by load',
       optimizeStandby: 'standby, below threshold',
@@ -726,8 +721,6 @@ if (__CGPT_BROWSER__) {
   const MOOD_TEXT_ID = 'cgpt-vs-mood-text';
   const MOOD_SUB_ID = 'cgpt-vs-mood-sub';
 
-  // Feature Pack 容器
-  const FP_ID = 'cgpt-vs-featurepack';
   // endregion: Storage Keys & DOM IDs
 
   // region: Runtime State
@@ -807,13 +800,6 @@ if (__CGPT_BROWSER__) {
     usedMB: null,
     turns: 0,
     plan: null
-  };
-  let tokenState = {
-    nextAt: 0,
-    pending: false,
-    value: 0,
-    timer: 0,
-    instance: 0
   };
   let uiRefs = null;
   let moodState = {
@@ -5839,6 +5825,7 @@ if (__CGPT_BROWSER__) {
   function scoreModelCandidate(el, mainLeft) {
     if (!isElementVisible(el)) return Infinity;
     const rect = el.getBoundingClientRect();
+    if (rect.top > (window.innerHeight * FOLLOW_BOTTOM_ZONE_RATIO)) return Infinity;
     let score = (rect.top * 6) + rect.left;
     if (el.closest && el.closest('header')) score -= 140;
     if (el.closest && el.closest('main')) score -= 60;
@@ -6089,22 +6076,6 @@ if (__CGPT_BROWSER__) {
         mainLeft
       };
     }
-    const voiceButton = findVoiceActionButton(mainLeft);
-    if (voiceButton) {
-      return {
-        element: voiceButton,
-        kind: 'voice',
-        mainLeft
-      };
-    }
-    const composer = findComposerAnchor(mainLeft);
-    if (composer) {
-      return {
-        element: composer,
-        kind: 'composer',
-        mainLeft
-      };
-    }
     return {
       element: null,
       kind: 'fallback',
@@ -6185,26 +6156,6 @@ if (__CGPT_BROWSER__) {
   function stopFollowPositionLoop() {
     if (followTimer) clearTimeout(followTimer);
     followTimer = null;
-  }
-
-  // ========================== Feature Pack：Token ==========================
-  function estimateTokens() {
-    const nodes = getMessageNodes();
-    const scratch = document.createElement('div');
-    let total = 0;
-    for (const node of nodes) {
-      let chunk = '';
-      const backup = node?.dataset?.vsSlimmed ? node?.dataset?.vsBackup : '';
-      if (backup) {
-        scratch.innerHTML = backup;
-        chunk = scratch.innerText || '';
-      }
-      else {
-        chunk = node.innerText || '';
-      }
-      total += chunk.length;
-    }
-    return Math.round(total / 4);
   }
 
   // ========================== UI：主题适配 ==========================
@@ -7170,52 +7121,6 @@ if (__CGPT_BROWSER__) {
       .cgpt-vs-link{ color: rgba(37,99,235,0.95); text-decoration:none; font-weight: 600; font-size: 12px; }
       .cgpt-vs-link:hover{ text-decoration: underline; }
 
-      /* ✅ Feature Pack 工具条：紧凑+对齐+不乱 */
-      #${FP_ID}{
-        margin-top: 8px;
-        display:flex;
-        align-items:center;
-        justify-content:flex-start;
-        gap:8px;
-        flex-wrap: wrap;
-        width: 100%;
-      }
-      #${FP_ID} .fp-token{
-        display:inline-flex;
-        align-items:center;
-        gap:8px;
-        height: var(--cgpt-vs-control-h-chip);
-        padding: 0 10px;
-        border-radius: var(--cgpt-vs-radius-pill);
-        border: 1px solid var(--cgpt-glass-border);
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
-        color: rgba(0,0,0,0.78);
-        backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
-        -webkit-backdrop-filter: blur(var(--cgpt-glass-blur)) saturate(var(--cgpt-glass-sat));
-        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
-        font-size: 12px;
-        font-weight: 600;
-        white-space: nowrap;
-      }
-      #${FP_ID} .fp-token-label{
-        color: rgba(0,0,0,0.62);
-        font-weight: 600;
-      }
-      #${FP_ID} .fp-token-value{
-        min-width: 40px;
-        height: 20px;
-        padding: 0 8px;
-        border-radius: var(--cgpt-vs-radius-pill);
-        border: 1px solid rgba(16,185,129,0.55);
-        background: linear-gradient(140deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08));
-        color: #065f46;
-        font-weight: 800;
-        font-variant-numeric: tabular-nums;
-        display:inline-flex;
-        align-items:center;
-        justify-content:center;
-      }
-
       #${HELP_ID}{
         position: fixed;
         inset: 0;
@@ -7496,20 +7401,6 @@ if (__CGPT_BROWSER__) {
         background: linear-gradient(90deg, #34d399, #22d3ee);
       }
       #${ROOT_ID}.theme-dark .cgpt-vs-link{ color: rgba(147,197,253,0.98); }
-      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token{
-        border-color: var(--cgpt-glass-border);
-        background: linear-gradient(145deg, var(--cgpt-glass-chip), var(--cgpt-glass-chip-2));
-        color: rgba(255,255,255,0.9);
-        box-shadow: var(--cgpt-glass-shadow-soft), var(--cgpt-glass-inset);
-      }
-      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token-label{
-        color: rgba(255,255,255,0.72);
-      }
-      #${ROOT_ID}.theme-dark #${FP_ID} .fp-token-value{
-        border-color: rgba(52,211,153,0.62);
-        background: linear-gradient(140deg, rgba(16,185,129,0.34), rgba(16,185,129,0.16));
-        color: #d1fae5;
-      }
       #${ROOT_ID}.theme-dark .mem-ok{ color:#4ade80; }
       #${ROOT_ID}.theme-dark .mem-warn{ color:#fbbf24; }
       #${ROOT_ID}.theme-dark .mem-bad{ color:#f87171; }
@@ -7847,10 +7738,6 @@ if (__CGPT_BROWSER__) {
                   </div>
                 </div>
 
-                <div class="cgpt-vs-mol-group">
-                  <div class="cgpt-vs-groupTitle">Feature Pack</div>
-                  <div id="${FP_ID}"></div>
-                </div>
               </div>
             </section>
             <section class="cgpt-vs-org cgpt-vs-organism cgpt-vs-org-mood" id="${MOOD_SECTION_ID}">
@@ -7929,85 +7816,6 @@ if (__CGPT_BROWSER__) {
     refreshMoodFromApi();
 
     return root;
-  }
-
-  // ========================== Feature Pack 渲染 ==========================
-  function renderFeaturePack(forceRebuild) {
-    const root = document.getElementById(ROOT_ID);
-    if (!root) return;
-
-    const slot = root.querySelector('#' + FP_ID);
-    if (!slot) return;
-
-    if (!forceRebuild && slot.childElementCount) return;
-
-    tokenState.instance += 1;
-    const instance = tokenState.instance;
-    tokenState.pending = false;
-    if (tokenState.timer) {
-      clearTimeout(tokenState.timer);
-      tokenState.timer = 0;
-    }
-
-    slot.innerHTML = '';
-
-    const token = document.createElement('span');
-    token.className = 'fp-token';
-    const tokenLabel = document.createElement('span');
-    tokenLabel.className = 'fp-token-label';
-    const tokenValue = document.createElement('span');
-    tokenValue.className = 'fp-token-value';
-    token.append(tokenLabel, tokenValue);
-    slot.append(token);
-
-    // token 更新
-    const setTokenView = (value) => {
-      const numeric = Number(value);
-      const display = Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
-      tokenLabel.textContent = t('token');
-      tokenValue.textContent = String(display);
-      token.setAttribute('aria-label', `${t('token')}: ${display}`);
-    };
-    setTokenView(tokenState.value || 0);
-    const tick = () => {
-      if (instance !== tokenState.instance) return;
-      if (!document.body.contains(token)) return;
-      const rootEl = document.getElementById(ROOT_ID);
-      const open = !!rootEl && rootEl.classList.contains('open');
-      const now = Date.now();
-
-      if (open && now >= tokenState.nextAt && !tokenState.pending) {
-        const busy = autoPauseOnChat && updateChatBusy(false);
-        if (busy) {
-          tokenState.nextAt = Date.now() + TOKEN_UPDATE_MIN_MS;
-          return;
-        }
-        tokenState.pending = true;
-        const run = () => {
-          if (instance !== tokenState.instance) return;
-          if (!document.body.contains(token)) {
-            tokenState.pending = false;
-            return;
-          }
-          const value = estimateTokens();
-          tokenState.value = value;
-          setTokenView(value);
-          tokenState.pending = false;
-          tokenState.nextAt = Date.now() + TOKEN_UPDATE_MIN_MS;
-        };
-        if (typeof requestIdleCallback === 'function') {
-          requestIdleCallback(() => run(), { timeout: 1200 });
-        }
-        else {
-          setTimeout(run, 0);
-        }
-      }
-
-      const delay = open ? TOKEN_UPDATE_MIN_MS : TOKEN_UPDATE_MAX_MS;
-      tokenState.timer = setTimeout(tick, delay);
-    };
-    tokenState.nextAt = 0;
-    tick();
   }
 
   function formatUIState(state) {
@@ -8186,8 +7994,6 @@ if (__CGPT_BROWSER__) {
     installDrag(root);
     refreshSegUI(root);
 
-    // ✅ Feature Pack 一体化渲染
-    renderFeaturePack(true);
   }
 
   function refreshSegUI(root) {
@@ -9089,8 +8895,6 @@ if (__CGPT_BROWSER__) {
       else {
         // Avoid moving the top bar while the panel is open.
         if (!pinned && !root.classList.contains('open')) positionNearModelButton();
-        // Feature Pack 容器丢失时重绘
-        renderFeaturePack(false);
         ensureThemeObservation();
         installScrollHook();
         inspectRouteForAutoScroll(false);
