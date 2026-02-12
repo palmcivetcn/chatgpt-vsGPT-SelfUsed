@@ -14,9 +14,10 @@ A glassmorphism long-chat optimizer for ChatGPT: virtual scrolling, health indic
 - Script file: `ChatGPT-Glass-Engine-gpt-super.js`
 
 ## Auto Update
-- Userscript metadata uses `@downloadURL` and `@updateURL` to track the latest GitHub Release asset.
-- Stable asset name: `chatgpt-glass-engine.user.js`.
-- Repository must be public for unauthenticated userscript auto-update checks.
+- Userscript metadata `@downloadURL` and `@updateURL` points to:
+  `https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js`
+- Auto update checks follow the raw `main` script path directly.
+- Release asset `chatgpt-glass-engine.user.js` is still uploaded as a backup channel for manual download/rollback.
 
 ## Versioning
 - Source of truth: `@version` in the userscript header.
