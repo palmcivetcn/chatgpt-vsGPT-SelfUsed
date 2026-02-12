@@ -2,7 +2,7 @@ const assert = require('assert');
 
 let mod = null;
 try {
-  mod = require('../ChatGPT Glass Engine gpt super.js');
+  mod = require('../ChatGPT-Glass-Engine-gpt-super.js');
 }
 catch (err) {
   mod = null;

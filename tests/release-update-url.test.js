@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const scriptPath = path.resolve(__dirname, '..', 'ChatGPT Glass Engine gpt super.js');
+const scriptPath = path.resolve(__dirname, '..', 'ChatGPT-Glass-Engine-gpt-super.js');
 const script = fs.readFileSync(scriptPath, 'utf8');
 
 const expectedUrl = 'https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js';
