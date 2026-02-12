@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.8
+// @version      1.2.9
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
-// @downloadURL  https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
-// @updateURL    https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js
+// @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
+// @updateURL    https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
 // @connect      chatgpt.com
@@ -227,77 +227,6 @@ function resolveLayerYieldZIndex({
   return Math.max(minSafe, top - 1);
 }
 
-function resolveKeepCoopMode({
-  now = Date.now(),
-  enabled = true,
-  keepDetected = false,
-  turns = 0,
-  domNodes = 0,
-  active = false,
-  coolSince = 0,
-  enterTurns = 180,
-  enterDomNodes = 2600,
-  exitTurns = 150,
-  exitDomNodes = 2200,
-  exitHoldMs = 10000
-} = {}) {
-  const tsNow = Number.isFinite(now) ? now : Date.now();
-  const turnsNum = Math.max(0, Number(turns) || 0);
-  const domNum = Math.max(0, Number(domNodes) || 0);
-  const holdMs = Math.max(0, Number(exitHoldMs) || 0);
-  const enterByTurns = turnsNum >= Math.max(0, Number(enterTurns) || 0);
-  const enterByDom = domNum >= Math.max(0, Number(enterDomNodes) || 0);
-  const belowExitTurns = turnsNum < Math.max(0, Number(exitTurns) || 0);
-  const belowExitDom = domNum < Math.max(0, Number(exitDomNodes) || 0);
-  const overEnter = enterByTurns || enterByDom;
-  const belowExit = belowExitTurns && belowExitDom;
-  const wasActive = !!active;
-
-  if (!enabled || !keepDetected) {
-    return {
-      active: false,
-      nextCoolSince: 0,
-      shouldEnter: false,
-      shouldExit: wasActive
-    };
-  }
-
-  if (!wasActive) {
-    return {
-      active: overEnter,
-      nextCoolSince: 0,
-      shouldEnter: overEnter,
-      shouldExit: false
-    };
-  }
-
-  if (overEnter || !belowExit) {
-    return {
-      active: true,
-      nextCoolSince: 0,
-      shouldEnter: false,
-      shouldExit: false
-    };
-  }
-
-  const nextCoolSince = (Number.isFinite(coolSince) && coolSince > 0) ? coolSince : tsNow;
-  if ((tsNow - nextCoolSince) >= holdMs) {
-    return {
-      active: false,
-      nextCoolSince: 0,
-      shouldEnter: false,
-      shouldExit: true
-    };
-  }
-
-  return {
-    active: true,
-    nextCoolSince,
-    shouldEnter: false,
-    shouldExit: false
-  };
-}
-
 function buildConversationExportMarkdown({
   title = '',
   url = '',
@@ -443,7 +372,6 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveRouteAutoScrollDecision,
     resolveLayerYieldMode,
     resolveLayerYieldZIndex,
-    resolveKeepCoopMode,
     buildConversationExportMarkdown,
     resolveOptimizingStatus,
     buildStructuredLogExport
@@ -500,7 +428,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '8.0.0';
+  const SCRIPT_VERSION = '1.2.9';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -508,12 +436,6 @@ if (__CGPT_BROWSER__) {
   const LAYER_Z_GENERIC_FALLBACK = 3500;
   const LAYER_Z_MIN = 1;
   const LAYER_SYNC_MS = 300;
-  const KEEP_COOP_ENTER_TURNS = 180;
-  const KEEP_COOP_ENTER_DOM_NODES = 2600;
-  const KEEP_COOP_EXIT_TURNS = 150;
-  const KEEP_COOP_EXIT_DOM_NODES = 2200;
-  const KEEP_COOP_EXIT_HOLD_MS = 10000;
-  const KEEP_COOP_REOPTIMIZE_MS = 5000;
   const SUPPORTS_CV = (() => {
     try {
       return typeof CSS !== 'undefined' && CSS.supports && CSS.supports('content-visibility: auto');
@@ -800,12 +722,10 @@ if (__CGPT_BROWSER__) {
   const KEY_POS = 'cgpt_vs_pos';
   const KEY_LAST_OPEN = 'cgpt_vs_open';
   const KEY_CHAT_PAUSE = 'cgpt_vs_pause_on_chat';
-  const KEY_KEEP_COOP_ENABLED = 'cgpt_vs_keep_coop_enabled';
   const KEY_IP_LOGS = 'cgpt_glass_ip_logs';
 
   // ========================== DOM IDs ==========================
   const STYLE_ID = 'cgpt-vs-style';
-  const KEEP_COOP_STYLE_ID = 'cgpt-vs-keep-coop-style';
   const ROOT_ID = 'cgpt-vs-root';
   const DOT_ID = 'cgpt-vs-dot';
   const BTN_ID = 'cgpt-vs-btn';
@@ -928,11 +848,6 @@ if (__CGPT_BROWSER__) {
   let layerSyncPending = false;
   let layerYieldMode = 'none';
   let layerYieldZIndex = LAYER_Z_NORMAL;
-  let keepCoopEnabled = loadBool(KEY_KEEP_COOP_ENABLED, true);
-  let keepCoopDetected = false;
-  let keepCoopActive = false;
-  let keepCoopCalmSince = 0;
-  let keepCoopLastOptimizeAt = 0;
   let moodState = {
     index: -1,
     nextAt: 0,
@@ -2355,9 +2270,6 @@ if (__CGPT_BROWSER__) {
       degradedIpScore: degradedState.ip.qualityScore,
       degradedPowDifficulty: degradedState.pow.difficulty,
       degradedPowLevel: degradedState.pow.levelLabel,
-      keepCoopEnabled,
-      keepCoopDetected,
-      keepCoopActive,
       scrollRoot: scrollRootIsWindow ? 'window' : (scrollRoot && scrollRoot.tagName ? scrollRoot.tagName.toLowerCase() : 'element')
     };
   }
@@ -6484,145 +6396,6 @@ if (__CGPT_BROWSER__) {
     syncUiLayerPriority(true);
   }
 
-  function ensureKeepCoopStyle() {
-    let style = document.getElementById(KEEP_COOP_STYLE_ID);
-    if (style) return style;
-    style = document.createElement('style');
-    style.id = KEEP_COOP_STYLE_ID;
-    style.textContent = `
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="assistant"]::after,
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="user"]::after{
-        display:none !important;
-      }
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="assistant"],
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="user"]{
-        padding-left: 1.8rem !important;
-        padding-right: 1.8rem !important;
-      }
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="assistant"] > div.w-full > div,
-      body.cgpt-vs-keep-coop .kkeenobservation main div[data-message-author-role="user"] > div.w-full > div{
-        border-radius: 1rem !important;
-      }
-      body.cgpt-vs-keep-coop .kmenu-item,
-      body.cgpt-vs-keep-coop .kdialogbtn,
-      body.cgpt-vs-keep-coop .kdialogclose{
-        transition: none !important;
-        transform: none !important;
-      }
-      body.cgpt-vs-keep-coop .kmenu-item:hover,
-      body.cgpt-vs-keep-coop .kdialogbtn:hover,
-      body.cgpt-vs-keep-coop .kdialogclose:hover{
-        transform: none !important;
-      }
-    `;
-    document.documentElement.appendChild(style);
-    return style;
-  }
-
-  function applyKeepCoopClass() {
-    if (!document.body) return;
-    if (keepCoopEnabled && keepCoopActive) {
-      ensureKeepCoopStyle();
-      document.body.classList.add('cgpt-vs-keep-coop');
-    }
-    else {
-      document.body.classList.remove('cgpt-vs-keep-coop');
-    }
-  }
-
-  function detectKeepCompanion() {
-    return !!document.querySelector('#kcg, .kmenu, .kdialog-overlay, #xcanwin');
-  }
-
-  function getKeepCoopStateSnapshot() {
-    return {
-      enabled: !!keepCoopEnabled,
-      active: !!keepCoopActive,
-      keepDetected: !!keepCoopDetected,
-      calmSince: keepCoopCalmSince || 0,
-      layerMode: layerYieldMode,
-      layerZIndex: layerYieldZIndex,
-      thresholds: {
-        enterTurns: KEEP_COOP_ENTER_TURNS,
-        enterDomNodes: KEEP_COOP_ENTER_DOM_NODES,
-        exitTurns: KEEP_COOP_EXIT_TURNS,
-        exitDomNodes: KEEP_COOP_EXIT_DOM_NODES,
-        exitHoldMs: KEEP_COOP_EXIT_HOLD_MS
-      }
-    };
-  }
-
-  function setKeepCoopEnabled(nextEnabled) {
-    const next = !!nextEnabled;
-    if (keepCoopEnabled === next) return getKeepCoopStateSnapshot();
-    keepCoopEnabled = next;
-    saveBool(KEY_KEEP_COOP_ENABLED, keepCoopEnabled);
-    if (!keepCoopEnabled) {
-      keepCoopActive = false;
-      keepCoopCalmSince = 0;
-    }
-    applyKeepCoopClass();
-    logEvent('info', 'keep.coop.toggle', {
-      enabled: keepCoopEnabled
-    });
-    updateUI(true);
-    return getKeepCoopStateSnapshot();
-  }
-
-  function syncKeepCoopState({
-    now = Date.now(),
-    turns = 0,
-    domNodes = 0,
-    force = false
-  } = {}) {
-    const tsNow = Number.isFinite(now) ? now : Date.now();
-    const turnsCount = Math.max(0, Number(turns) || 0);
-    const domCount = Math.max(0, Number(domNodes) || 0);
-    keepCoopDetected = detectKeepCompanion();
-
-    const decision = resolveKeepCoopMode({
-      now: tsNow,
-      enabled: keepCoopEnabled,
-      keepDetected: keepCoopDetected,
-      turns: turnsCount,
-      domNodes: domCount,
-      active: keepCoopActive,
-      coolSince: keepCoopCalmSince,
-      enterTurns: KEEP_COOP_ENTER_TURNS,
-      enterDomNodes: KEEP_COOP_ENTER_DOM_NODES,
-      exitTurns: KEEP_COOP_EXIT_TURNS,
-      exitDomNodes: KEEP_COOP_EXIT_DOM_NODES,
-      exitHoldMs: KEEP_COOP_EXIT_HOLD_MS
-    });
-
-    keepCoopCalmSince = decision.nextCoolSince || 0;
-    const prevActive = keepCoopActive;
-    keepCoopActive = !!decision.active;
-
-    if (force || prevActive !== keepCoopActive) {
-      applyKeepCoopClass();
-      if (force || prevActive !== keepCoopActive) {
-        logEvent('info', keepCoopActive ? 'keep.coop.enter' : 'keep.coop.exit', {
-          keepDetected: keepCoopDetected,
-          turns: turnsCount,
-          domNodes: domCount
-        });
-      }
-      if (!prevActive && keepCoopActive) {
-        runAutoOptimize('keep-coop-enter');
-        keepCoopLastOptimizeAt = tsNow;
-      }
-    }
-
-    const pausedByChat = autoPauseOnChat && chatBusy;
-    if (keepCoopActive && keepCoopEnabled && keepCoopDetected && !ctrlFFreeze && !pausedByChat) {
-      if ((tsNow - keepCoopLastOptimizeAt) >= KEEP_COOP_REOPTIMIZE_MS) {
-        runAutoOptimize('keep-coop-refresh');
-        keepCoopLastOptimizeAt = tsNow;
-      }
-    }
-  }
-
   // ========================== UI：主题适配 ==========================
   function isDarkTheme() {
     const docEl = document.documentElement;
@@ -8967,15 +8740,6 @@ if (__CGPT_BROWSER__) {
       turns = uiCache.turns || lastTurnsCount || 0;
     }
 
-    const coopTurns = Number.isFinite(turns) ? turns : (lastTurnsCount || 0);
-    const coopDomNodes = Number.isFinite(domNodes) ? domNodes : (Number.isFinite(uiCache.domNodes) ? uiCache.domNodes : getDomNodeCount());
-    syncKeepCoopState({
-      now,
-      turns: coopTurns,
-      domNodes: coopDomNodes,
-      force: !!force
-    });
-
     const memInfo = memoryLevel(usedMB);
     const domInfo = domLevel(domNodes);
     const degraded = getDegradedHealth();
@@ -9392,8 +9156,6 @@ if (__CGPT_BROWSER__) {
     PAGE_WIN.CGPT_VS.selfCheck = () => SelfCheck.run();
     PAGE_WIN.CGPT_VS.setChatPause = setChatPause;
     PAGE_WIN.CGPT_VS.scrollToLatest = scrollToLatest;
-    PAGE_WIN.CGPT_VS.getKeepCoopState = getKeepCoopStateSnapshot;
-    PAGE_WIN.CGPT_VS.setKeepCoopEnabled = setKeepCoopEnabled;
     PAGE_WIN.CGPT_VS.refreshMonitor = () => {
       Monitor.refreshAll(true, { pow: true });
     };
