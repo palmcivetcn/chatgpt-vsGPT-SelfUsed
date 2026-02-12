@@ -5,7 +5,7 @@ const path = require('path');
 const scriptPath = path.resolve(__dirname, '..', 'ChatGPT-Glass-Engine-gpt-super.js');
 const script = fs.readFileSync(scriptPath, 'utf8');
 
-const expectedUrl = 'https://github.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/releases/latest/download/chatgpt-glass-engine.user.js';
+const expectedUrl = 'https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js';
 
 const downloadMatch = script.match(/^\/\/ @downloadURL\s+(.+)$/m);
 assert.ok(downloadMatch, '@downloadURL is missing');
