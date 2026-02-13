@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.14
+// @version      1.3.2
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -475,6 +475,50 @@ function resolveDegradedOverallSeverity({
   return 'na';
 }
 
+function resolveOptimizeTagState({
+  lang = 'zh',
+  yielding = false,
+  optimizing = false,
+  virtualizationEnabled = true,
+  virtualizedCount = 0
+} = {}) {
+  if (yielding) {
+    return {
+      status: 'yielding',
+      label: lang === 'zh' ? '避让中' : 'Yielding',
+      color: '#f59e0b',
+      tip: lang === 'zh'
+        ? '回复生成中，优化已避让'
+        : 'Assistant replying: optimization yields temporarily'
+    };
+  }
+  if (optimizing) {
+    return {
+      status: 'optimizing',
+      label: lang === 'zh' ? '优化中' : 'Optimizing',
+      color: '#3b82f6',
+      tip: lang === 'zh' ? '正在优化渲染负载' : 'Optimization in progress'
+    };
+  }
+  const count = Math.max(0, Number(virtualizedCount) || 0);
+  if (virtualizationEnabled && count > 0) {
+    return {
+      status: 'optimized',
+      label: lang === 'zh' ? '已优化' : 'Optimized',
+      color: '#10b981',
+      tip: lang === 'zh'
+        ? `已优化 ${count} 条内容`
+        : `Optimized ${count} nodes`
+    };
+  }
+  return {
+    status: 'idle',
+    label: lang === 'zh' ? '空闲' : 'Idle',
+    color: '#9ca3af',
+    tip: lang === 'zh' ? '未进行优化' : 'No optimization running'
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
@@ -495,7 +539,8 @@ if (typeof module !== 'undefined' && module.exports) {
     summarizeStatusIncidents,
     resolveServicePollIntervalMs,
     shouldRefreshIpQuality,
-    resolveDegradedOverallSeverity
+    resolveDegradedOverallSeverity,
+    resolveOptimizeTagState
   };
 }
 
@@ -549,7 +594,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.14';
+  const SCRIPT_VERSION = '1.3.2';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -578,6 +623,7 @@ if (__CGPT_BROWSER__) {
   const FOLLOW_BOTTOM_ZONE_RATIO = 0.45;
   const FOLLOW_ANCHOR_GAP_PX = 8;
   const OPTIMIZE_HOLD_MS = 420;
+  const OPTIMIZE_UI_HOLD_MS = 2200;
   const HARD_SLICE_TURNS = 140;
   const HARD_SLICE_BUDGET_MIN_MS = 4;
   const HARD_SLICE_BUDGET_MAX_MS = 12;
@@ -5308,6 +5354,9 @@ if (__CGPT_BROWSER__) {
   }
 
   function runAutoOptimize(reason) {
+    const trigger = String(reason || 'manual');
+    const triggeredByUi = trigger === 'ui' || trigger === 'manual';
+    const now = Date.now();
     const domNodes = getDomNodeCount();
     const usedMB = getUsedHeapMB();
     const planned = planOptimizeMargins(domNodes, usedMB);
@@ -5321,9 +5370,9 @@ if (__CGPT_BROWSER__) {
 
     if (shouldHard) {
       hardActive = true;
-      hardActiveSource = 'auto';
+      hardActiveSource = triggeredByUi ? 'manual' : 'auto';
       autoHardBelowAt = 0;
-      lastAutoHardAt = Date.now();
+      lastAutoHardAt = now;
     }
     else {
       hardActive = false;
@@ -5332,26 +5381,35 @@ if (__CGPT_BROWSER__) {
       restoreHardSlimAll();
     }
 
+    // Make status tag visibly show optimization after manual trigger.
+    markOptimizeWork();
+    optimizeBusyUntil = Math.max(
+      Number.isFinite(optimizeBusyUntil) ? optimizeBusyUntil : 0,
+      now + OPTIMIZE_UI_HOLD_MS
+    );
+
     setMarginOverridePlan({
       soft: planned.soft,
       hard: planned.hard,
       desiredSoft: planned.base.desiredSoft,
       desiredHard: planned.base.desiredHard,
       turns: planned.base.turns
-    }, reason || 'optimize');
+    }, trigger || 'optimize');
 
     scheduleVirtualize(planned.soft);
     updateUI();
     flashDot();
 
     logEvent('info', 'optimize.auto', {
-      reason: reason || 'manual',
+      reason: trigger || 'manual',
       pressure,
       domNodes,
       memMB: usedMB == null ? null : Number(usedMB.toFixed(1)),
       softScreens: planned.soft,
       hardScreens: planned.hard,
-      hardActive: shouldHard
+      hardActive: shouldHard,
+      hardSource: hardActiveSource,
+      uiHoldMs: OPTIMIZE_UI_HOLD_MS
     });
   }
 
@@ -9348,15 +9406,18 @@ if (__CGPT_BROWSER__) {
     if (optTag) {
       const optimizing = isOptimizingNow();
       const yielding = pausedByChat;
-      const label = yielding
-        ? (lang === 'zh' ? '避让中' : 'Yielding')
-        : (optimizing ? (lang === 'zh' ? '优化中' : 'Optimizing') : (lang === 'zh' ? '空闲' : 'Idle'));
-      const color = yielding ? '#f59e0b' : (optimizing ? '#3b82f6' : '#9ca3af');
-      optTag.classList.toggle('optimizing', optimizing && !yielding);
+      const optState = resolveOptimizeTagState({
+        lang,
+        yielding,
+        optimizing,
+        virtualizationEnabled,
+        virtualizedCount: virt
+      });
+      const label = optState.label;
+      const color = optState.color;
+      optTag.classList.toggle('optimizing', optState.status === 'optimizing');
       optTag.classList.toggle('pause', yielding);
-      const optTip = yielding
-        ? (lang === 'zh' ? '回复生成中，优化已避让' : 'Assistant replying: optimization yields temporarily')
-        : (optimizing ? (lang === 'zh' ? '正在优化渲染负载' : 'Optimization in progress') : (lang === 'zh' ? '未进行优化' : 'No optimization running'));
+      const optTip = optState.tip;
       paintMiniItem(optTag, formatMiniLabel('opt', label), color, optTip);
     }
 
