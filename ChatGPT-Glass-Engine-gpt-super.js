@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.10
+// @version      1.2.11
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -361,6 +361,63 @@ function buildStructuredLogExport({
   };
 }
 
+function compactSingleLineText(value, maxLen = 120) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  const limit = Number.isFinite(Number(maxLen)) ? Math.max(12, Math.floor(Number(maxLen))) : 120;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 3)}...`;
+}
+
+function mapIncidentStatusLabel(status, lang = 'en') {
+  const key = String(status || '').toLowerCase();
+  if (lang === 'zh') {
+    if (key === 'investigating') return '调查中';
+    if (key === 'identified') return '已定位';
+    if (key === 'monitoring') return '监控中';
+    if (key === 'resolved') return '已恢复';
+    if (key === 'postmortem') return '复盘中';
+    return key || '未知';
+  }
+  if (key === 'investigating') return 'Investigating';
+  if (key === 'identified') return 'Identified';
+  if (key === 'monitoring') return 'Monitoring';
+  if (key === 'resolved') return 'Resolved';
+  if (key === 'postmortem') return 'Postmortem';
+  return key || 'Unknown';
+}
+
+function summarizeStatusIncidents(incidents, {
+  lang = 'en',
+  maxItems = 2,
+  maxNameLength = 76
+} = {}) {
+  const activeLang = lang === 'zh' ? 'zh' : 'en';
+  const limit = Math.max(1, Math.min(4, Math.floor(Number(maxItems) || 2)));
+  const nameLimit = Math.max(16, Math.floor(Number(maxNameLength) || 76));
+  const list = Array.isArray(incidents) ? incidents : [];
+  const unresolved = list.filter((item) => {
+    const status = String(item?.status || '').toLowerCase();
+    return status !== 'resolved';
+  });
+
+  const lines = unresolved.slice(0, limit).map((item, idx) => {
+    const name = compactSingleLineText(item?.name, nameLimit) || (activeLang === 'zh' ? '官方事件' : 'Official incident');
+    const statusLabel = mapIncidentStatusLabel(item?.status, activeLang);
+    return `${idx + 1}. ${name}${statusLabel ? ` (${statusLabel})` : ''}`;
+  });
+
+  if (unresolved.length > limit) {
+    const more = unresolved.length - limit;
+    lines.push(activeLang === 'zh' ? `... 另有 ${more} 条` : `... ${more} more`);
+  }
+
+  return {
+    count: unresolved.length,
+    lines
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
@@ -374,7 +431,10 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveLayerYieldZIndex,
     buildConversationExportMarkdown,
     resolveOptimizingStatus,
-    buildStructuredLogExport
+    buildStructuredLogExport,
+    compactSingleLineText,
+    mapIncidentStatusLabel,
+    summarizeStatusIncidents
   };
 }
 
@@ -428,7 +488,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.10';
+  const SCRIPT_VERSION = '1.2.11';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -629,6 +689,9 @@ if (__CGPT_BROWSER__) {
       monitorPowTip: 'PoW 难度越低越顺滑（绿色最好）',
       monitorIpTip: 'IP 质量来自 Scamalytics 评分',
       monitorServiceTip: '来自 status.openai.com 的官方状态',
+      monitorServiceSummary: '官方摘要',
+      monitorServiceIssues: '当前问题',
+      monitorServiceNoIssues: '当前无进行中的官方事件',
       monitorOpenStatus: '打开状态页',
       monitorCopyHistory: '点击复制历史',
       monitorCopyHint: '点击复制最近 10 条记录',
@@ -686,6 +749,9 @@ if (__CGPT_BROWSER__) {
       monitorPowTip: 'Lower PoW difficulty is faster (green is best)',
       monitorIpTip: 'IP quality is based on Scamalytics fraud score',
       monitorServiceTip: 'Official status from status.openai.com',
+      monitorServiceSummary: 'Official summary',
+      monitorServiceIssues: 'Current incidents',
+      monitorServiceNoIssues: 'No active official incidents',
       monitorOpenStatus: 'Open status page',
       monitorCopyHistory: 'Click to copy history',
       monitorCopyHint: 'Click to copy the most recent 10 records',
@@ -873,6 +939,9 @@ if (__CGPT_BROWSER__) {
     service: {
       indicator: 'none',
       description: '',
+      officialDescription: '',
+      issueLines: [],
+      issueCount: 0,
       color: '#10a37f',
       updatedAt: 0
     },
@@ -2458,6 +2527,9 @@ if (__CGPT_BROWSER__) {
         service: {
           indicator: degradedState.service.indicator,
           description: degradedState.service.description,
+          officialDescription: degradedState.service.officialDescription,
+          issueLines: degradedState.service.issueLines,
+          issueCount: degradedState.service.issueCount,
           color: degradedState.service.color,
           updatedAt: degradedState.service.updatedAt
         },
@@ -2502,6 +2574,16 @@ if (__CGPT_BROWSER__) {
     if (svc.indicator || svc.description) {
       degradedState.service.indicator = svc.indicator || degradedState.service.indicator;
       degradedState.service.description = svc.description || degradedState.service.description;
+      degradedState.service.officialDescription = svc.officialDescription || degradedState.service.officialDescription;
+      if (Array.isArray(svc.issueLines)) {
+        degradedState.service.issueLines = svc.issueLines
+          .map((line) => String(line || '').trim())
+          .filter(Boolean)
+          .slice(0, 4);
+      }
+      if (svc.issueCount != null && Number.isFinite(Number(svc.issueCount))) {
+        degradedState.service.issueCount = Number(svc.issueCount);
+      }
       degradedState.service.color = svc.color || degradedState.service.color;
       degradedState.service.updatedAt = svc.updatedAt || degradedState.service.updatedAt;
     }
@@ -3931,18 +4013,29 @@ if (__CGPT_BROWSER__) {
     try {
       if (!shouldRefreshDegraded(force)) return;
       if (!force && isFresh(degradedState.service.updatedAt, DEG_STATUS_REFRESH_MS)) return;
-      const text = await gmRequestText('https://status.openai.com/api/v2/status.json', 4000);
+      const text = await gmRequestText('https://status.openai.com/api/v2/summary.json', 4500);
       const data = JSON.parse(text);
       const status = data?.status || {};
-      const info = getServiceIndicatorInfo(status.indicator, status.description);
+      const incidents = Array.isArray(data?.incidents) ? data.incidents : [];
+      const incidentSummary = summarizeStatusIncidents(incidents, {
+        lang,
+        maxItems: 2,
+        maxNameLength: lang === 'zh' ? 34 : 64
+      });
+      const officialDescription = compactSingleLineText(status.description || '', 120);
+      const info = getServiceIndicatorInfo(status.indicator, officialDescription || status.description);
       degradedState.service.indicator = String(status.indicator || 'none').toLowerCase();
       degradedState.service.description = info.label;
+      degradedState.service.officialDescription = officialDescription || info.label;
+      degradedState.service.issueLines = incidentSummary.lines;
+      degradedState.service.issueCount = incidentSummary.count;
       degradedState.service.color = info.color;
       degradedState.service.updatedAt = Date.now();
       saveDegradedCache();
       logEvent('debug', 'degraded.status', {
         indicator: degradedState.service.indicator,
-        description: degradedState.service.description
+        description: degradedState.service.description,
+        issueCount: degradedState.service.issueCount
       });
       updateUI();
     }
@@ -8542,7 +8635,31 @@ if (__CGPT_BROWSER__) {
         serviceTag = t('monitorUnknown');
       }
     }
-    const serviceTip = `${t('monitorServiceTip')}\n${t('monitorOpenStatus')}${serviceFresh ? '' : `\n${getStaleHint(degradedState.service.updatedAt)}`}`;
+    const serviceOfficial = compactSingleLineText(
+      degradedState.service.officialDescription || degradedState.service.description || '',
+      120
+    );
+    const serviceIssueLines = Array.isArray(degradedState.service.issueLines)
+      ? degradedState.service.issueLines.filter(Boolean)
+      : [];
+    const serviceIssueCount = Number.isFinite(Number(degradedState.service.issueCount))
+      ? Number(degradedState.service.issueCount)
+      : serviceIssueLines.length;
+    const serviceTipLines = [t('monitorServiceTip')];
+    if (serviceOfficial) {
+      serviceTipLines.push(`${t('monitorServiceSummary')}: ${serviceOfficial}`);
+    }
+    if (serviceIssueLines.length) {
+      const issueTitle = serviceIssueCount > 0 ? `${t('monitorServiceIssues')} (${serviceIssueCount})` : t('monitorServiceIssues');
+      serviceTipLines.push(`${issueTitle}:`);
+      serviceTipLines.push(...serviceIssueLines);
+    }
+    else if (serviceFresh && degradedState.service.indicator === 'none') {
+      serviceTipLines.push(t('monitorServiceNoIssues'));
+    }
+    serviceTipLines.push(t('monitorOpenStatus'));
+    if (!serviceFresh) serviceTipLines.push(getStaleHint(degradedState.service.updatedAt));
+    const serviceTip = serviceTipLines.join('\n');
     if (serviceDescEl) {
       serviceDescEl.textContent = serviceDesc;
       serviceDescEl.style.color = serviceColor;
