@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.11
+// @version      1.2.12
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -418,6 +418,50 @@ function summarizeStatusIncidents(incidents, {
   };
 }
 
+function resolveServicePollIntervalMs({
+  indicator = 'none',
+  okMs = 15 * 60 * 1000,
+  degradedMs = 6 * 60 * 1000
+} = {}) {
+  const ind = String(indicator || '').toLowerCase();
+  return (ind && ind !== 'none') ? degradedMs : okMs;
+}
+
+function shouldRefreshIpQuality({
+  force = false,
+  ip = '',
+  qualityIp = '',
+  qualityLabel = '',
+  qualityScore = null
+} = {}) {
+  if (!ip) return false;
+  if (force) return true;
+  const hasCache = !!String(qualityLabel || '').trim() || qualityScore != null;
+  if (ip !== qualityIp) return true;
+  return !hasCache;
+}
+
+function resolveDegradedOverallSeverity({
+  serviceSev = 'na',
+  ipSev = 'na',
+  powSev = 'na'
+} = {}) {
+  if (serviceSev === 'bad') return 'bad';
+  const badCount = (ipSev === 'bad' ? 1 : 0) + (powSev === 'bad' ? 1 : 0);
+  if (badCount >= 2) return 'bad';
+  if (
+    serviceSev === 'warn' ||
+    ipSev === 'bad' ||
+    ipSev === 'warn' ||
+    powSev === 'bad' ||
+    powSev === 'warn'
+  ) {
+    return 'warn';
+  }
+  if (serviceSev === 'ok' || ipSev === 'ok' || powSev === 'ok') return 'ok';
+  return 'na';
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateIdleGate,
@@ -434,7 +478,10 @@ if (typeof module !== 'undefined' && module.exports) {
     buildStructuredLogExport,
     compactSingleLineText,
     mapIncidentStatusLabel,
-    summarizeStatusIncidents
+    summarizeStatusIncidents,
+    resolveServicePollIntervalMs,
+    shouldRefreshIpQuality,
+    resolveDegradedOverallSeverity
   };
 }
 
@@ -488,7 +535,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.11';
+  const SCRIPT_VERSION = '1.2.12';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -629,11 +676,12 @@ if (__CGPT_BROWSER__) {
   };
 
   // ========================== 服务降级监控常量 ==========================
-  const DEG_STATUS_REFRESH_MS = 2 * 60 * 1000;
+  const DEG_STATUS_REFRESH_OK_MS = 15 * 60 * 1000;
+  const DEG_STATUS_REFRESH_ALERT_MS = 6 * 60 * 1000;
   const DEG_IP_REFRESH_MS = 6 * 60 * 1000;
   const DEG_FETCH_MONITOR_FAST_MS = 1200;
   const DEG_FETCH_MONITOR_SLOW_MS = 7000;
-  const DEG_STATUS_TTL_MS = 5 * 60 * 1000;
+  const DEG_STATUS_TTL_MS = 35 * 60 * 1000;
   const DEG_IP_TTL_MS = 12 * 60 * 1000;
   const DEG_POW_TTL_MS = 6 * 60 * 1000;
   const DEG_POW_PROBE_COOLDOWN_MS = 90 * 1000;
@@ -2537,6 +2585,7 @@ if (__CGPT_BROWSER__) {
           masked: degradedState.ip.masked,
           full: degradedState.ip.full,
           warp: degradedState.ip.warp,
+          qualityIp: degradedState.ip.qualityIp,
           qualityLabel: degradedState.ip.qualityLabel,
           qualityShort: degradedState.ip.qualityShort,
           qualityProbability: degradedState.ip.qualityProbability,
@@ -2593,6 +2642,7 @@ if (__CGPT_BROWSER__) {
       degradedState.ip.masked = ip.masked || degradedState.ip.masked;
       degradedState.ip.full = ip.full || degradedState.ip.full;
       degradedState.ip.warp = ip.warp || degradedState.ip.warp;
+      degradedState.ip.qualityIp = ip.qualityIp || degradedState.ip.qualityIp;
       degradedState.ip.qualityLabel = ip.qualityLabel || degradedState.ip.qualityLabel;
       degradedState.ip.qualityShort = ip.qualityShort || degradedState.ip.qualityShort;
       degradedState.ip.qualityProbability = ip.qualityProbability || degradedState.ip.qualityProbability;
@@ -3449,9 +3499,9 @@ if (__CGPT_BROWSER__) {
     if (typeof value !== 'string') return false;
     const v = value.trim();
     if (!v) return false;
-    if (/^0x[0-9a-f]+$/i.test(v)) return true;
-    if (/^[0-9a-f]{2,}$/i.test(v)) return true;
-    if (/^\d+$/.test(v)) return true;
+    if (/^0x[0-9a-f]{4,}$/i.test(v)) return true;
+    if (/^[0-9a-f]{6,}$/i.test(v)) return true;
+    if (/^\d+$/.test(v)) return v.length >= 3;
     return false;
   }
 
@@ -3483,17 +3533,13 @@ if (__CGPT_BROWSER__) {
 
       const entries = Object.entries(value);
       for (const [key, val] of entries) {
-        const k = String(key || '').toLowerCase();
-        const keyHasPow = /pow|proof|work/.test(k);
-        const keyHasDiff = k.includes('difficulty');
-        if (keyHasPow) hasHint = true;
+        const rawKey = String(key || '');
+        const k = rawKey.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+        const keyHasPow = /(^|[_-])(pow|proof_of_work|proofofwork)([_-]|$)/.test(k) || k === 'pow';
+        const keyHasDiff = /(^|[_-])difficulty([_-]|$)/.test(k) || k.endsWith('difficulty');
+        if (/pow|proof/.test(k)) hasHint = true;
 
         if (keyHasDiff && (hint || keyHasPow)) {
-          const cand = normalizePowDifficulty(val);
-          if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
-        }
-
-        if (keyHasPow && !keyHasDiff) {
           const cand = normalizePowDifficulty(val);
           if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
         }
@@ -3518,7 +3564,7 @@ if (__CGPT_BROWSER__) {
 
     const direct =
       (root && typeof root === 'object')
-        ? (root.pow_difficulty ?? root.powDifficulty ?? root.difficulty)
+        ? (root.pow_difficulty ?? root.powDifficulty)
         : null;
     const cand = normalizePowDifficulty(direct);
     if (cand && isPowDifficultyLike(cand)) return { difficulty: cand, hasHint: true };
@@ -3536,8 +3582,29 @@ if (__CGPT_BROWSER__) {
         percentage: 0
       };
     }
-    const clean = String(difficulty).replace(/^0x/i, '').replace(/^0+/, '');
+    const raw = String(difficulty).trim();
+    const normalized = raw.replace(/^0x/i, '');
+    if (!normalized) {
+      return {
+        levelKey: 'riskUnknown',
+        levelLabel: t('riskUnknown'),
+        severity: 'na',
+        color: '#9ca3af',
+        percentage: 0
+      };
+    }
+    const decimalOnly = /^\d+$/.test(normalized);
+    const clean = normalized.replace(/^0+/, '');
     const len = clean.length || 0;
+    if (!len || (decimalOnly && len <= 2)) {
+      return {
+        levelKey: 'riskUnknown',
+        levelLabel: t('riskUnknown'),
+        severity: 'na',
+        color: '#9ca3af',
+        percentage: 0
+      };
+    }
     if (len <= 2) {
       return { levelKey: 'riskCritical', levelLabel: t('riskCritical'), severity: 'bad', color: '#ef4444', percentage: 100 };
     }
@@ -3614,13 +3681,32 @@ if (__CGPT_BROWSER__) {
     return !!(root && root.classList.contains('open'));
   }
 
+  function getServiceRefreshIntervalMs(indicator) {
+    return resolveServicePollIntervalMs({
+      indicator,
+      okMs: DEG_STATUS_REFRESH_OK_MS,
+      degradedMs: DEG_STATUS_REFRESH_ALERT_MS
+    });
+  }
+
+  function scheduleServiceStatusRefresh(delayMs = null) {
+    const nextMs = Number.isFinite(Number(delayMs))
+      ? Math.max(60 * 1000, Number(delayMs))
+      : getServiceRefreshIntervalMs(degradedState.service.indicator);
+    if (degradedTimers.status) {
+      clearTimeout(degradedTimers.status);
+      degradedTimers.status = 0;
+    }
+    degradedTimers.status = setTimeout(() => {
+      refreshServiceStatus(false);
+    }, nextMs);
+  }
+
   function shouldRefreshDegraded(force) {
     if (force) return true;
     if (document.hidden) return false;
     if (isUiOpen()) return true;
-    const serviceFresh = isFresh(degradedState.service.updatedAt, DEG_STATUS_TTL_MS);
-    const ipFresh = isFresh(degradedState.ip.qualityAt, DEG_IP_TTL_MS);
-    return !(serviceFresh && ipFresh);
+    return true;
   }
 
   // ========================== 服务降级监控：业务逻辑 ==========================
@@ -4012,7 +4098,12 @@ if (__CGPT_BROWSER__) {
   async function refreshServiceStatus(force = false) {
     try {
       if (!shouldRefreshDegraded(force)) return;
-      if (!force && isFresh(degradedState.service.updatedAt, DEG_STATUS_REFRESH_MS)) return;
+      const pollMs = getServiceRefreshIntervalMs(degradedState.service.indicator);
+      if (!force && degradedState.service.updatedAt) {
+        const elapsed = Date.now() - degradedState.service.updatedAt;
+        const minElapsed = Math.max(60 * 1000, pollMs - 5000);
+        if (elapsed < minElapsed) return;
+      }
       const text = await gmRequestText('https://status.openai.com/api/v2/summary.json', 4500);
       const data = JSON.parse(text);
       const status = data?.status || {};
@@ -4042,12 +4133,29 @@ if (__CGPT_BROWSER__) {
     catch (err) {
       logEvent('warn', 'degraded.status.fail', { message: err?.message || String(err) });
     }
+    finally {
+      if (degradedStarted) scheduleServiceStatusRefresh();
+    }
   }
 
   async function refreshIPQuality(ip, force = false) {
     if (!ip) return;
     const now = Date.now();
-    if (!force && degradedState.ip.qualityIp === ip && (now - degradedState.ip.qualityAt) < (DEG_IP_REFRESH_MS / 2)) return;
+    const shouldQuery = shouldRefreshIpQuality({
+      force,
+      ip,
+      qualityIp: degradedState.ip.qualityIp,
+      qualityLabel: degradedState.ip.qualityLabel,
+      qualityScore: degradedState.ip.qualityScore
+    });
+    if (!shouldQuery) {
+      degradedState.ip.qualityIp = ip;
+      degradedState.ip.qualityAt = now;
+      saveDegradedCache();
+      logEvent('debug', 'degraded.ip.quality.cache', { ip: maskIP(ip) });
+      updateUI();
+      return;
+    }
     try {
       const html = await gmRequestText(`https://scamalytics.com/ip/${ip}`, 4500);
       const info = parseScamalytics(html, ip);
@@ -4143,11 +4251,22 @@ if (__CGPT_BROWSER__) {
           const parsed = svc.parse(text);
           if (!parsed.ip) throw new Error('No IP in response');
 
+          const prevQualityIp = degradedState.ip.qualityIp || '';
+          const ipChanged = !!prevQualityIp && prevQualityIp !== parsed.ip;
           degradedState.ip.full = parsed.ip;
           degradedState.ip.masked = maskIP(parsed.ip);
           degradedState.ip.warp = parsed.warp || 'off';
           degradedState.ip.updatedAt = Date.now();
           degradedState.ip.error = '';
+          if (ipChanged) {
+            degradedState.ip.qualityLabel = t('monitorUnknown');
+            degradedState.ip.qualityShort = '';
+            degradedState.ip.qualityProbability = '';
+            degradedState.ip.qualityColor = '#9ca3af';
+            degradedState.ip.qualityScore = null;
+            degradedState.ip.qualityTooltip = t('monitorIpTip');
+            degradedState.ip.qualityAt = 0;
+          }
           saveDegradedCache();
           updateIpHistoryTooltip();
           logEvent('debug', 'degraded.ip', { ip: degradedState.ip.masked, warp: degradedState.ip.warp, svc: svc.url });
@@ -4503,8 +4622,10 @@ if (__CGPT_BROWSER__) {
     degradedStarted = true;
     Monitor.installHooks();
     startFetchMonitor();
-    Monitor.refreshAll(true, { pow: false });
-    degradedTimers.status = setInterval(() => refreshServiceStatus(false), DEG_STATUS_REFRESH_MS);
+    refreshServiceStatus(true);
+    refreshIPInfo(false);
+    refreshPowViaRequirements(false);
+    scheduleServiceStatusRefresh(DEG_STATUS_REFRESH_OK_MS);
     degradedTimers.ip = setInterval(() => refreshIPInfo(false), DEG_IP_REFRESH_MS);
   }
 
@@ -4559,7 +4680,7 @@ if (__CGPT_BROWSER__) {
       getPowRiskInfo(degradedState.pow.difficulty).severity :
       'na';
     return {
-      severity: maxSeverity([serviceSev, ipSev, powSev]),
+      severity: resolveDegradedOverallSeverity({ serviceSev, ipSev, powSev }),
       serviceSev,
       ipSev,
       powSev
@@ -8657,7 +8778,6 @@ if (__CGPT_BROWSER__) {
     else if (serviceFresh && degradedState.service.indicator === 'none') {
       serviceTipLines.push(t('monitorServiceNoIssues'));
     }
-    serviceTipLines.push(t('monitorOpenStatus'));
     if (!serviceFresh) serviceTipLines.push(getStaleHint(degradedState.service.updatedAt));
     const serviceTip = serviceTipLines.join('\n');
     if (serviceDescEl) {
