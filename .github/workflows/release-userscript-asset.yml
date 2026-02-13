@@ -23,4 +23,9 @@ jobs:
           SCRIPT_FILE: ChatGPT-Glass-Engine-gpt-super.js
           ASSET_NAME: chatgpt-glass-engine.user.js
         run: |
-          gh release upload "$TAG" "$SCRIPT_FILE#$ASSET_NAME" --repo "$GITHUB_REPOSITORY" --clobber
+          cp "$SCRIPT_FILE" "$ASSET_NAME"
+          LEGACY_ASSET_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[]? | select(.name == \"$SCRIPT_FILE\") | .id" | head -n1)"
+          if [ -n "$LEGACY_ASSET_ID" ]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$LEGACY_ASSET_ID"
+          fi
+          gh release upload "$TAG" "$ASSET_NAME" --repo "$GITHUB_REPOSITORY" --clobber
