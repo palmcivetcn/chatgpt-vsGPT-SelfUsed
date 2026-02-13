@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.9
+// @version      1.2.10
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -428,7 +428,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.9';
+  const SCRIPT_VERSION = '1.2.10';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -7877,7 +7877,6 @@ if (__CGPT_BROWSER__) {
       const helpLayer = ensureHelpLayer();
       getUiRefs(root);
       bindHelpUI(root, helpLayer);
-      applyKeepCoopClass();
       syncUiLayerPriority(true);
       return root;
     }
@@ -8054,7 +8053,6 @@ if (__CGPT_BROWSER__) {
     applyPinnedState();
     updateMoodUI(true);
     refreshMoodFromApi();
-    applyKeepCoopClass();
     syncUiLayerPriority(true);
 
     return root;

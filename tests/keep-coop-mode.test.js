@@ -18,3 +18,9 @@ assert.equal(typeof mod.resolveKeepCoopMode, 'undefined', 'resolveKeepCoopMode s
 ].forEach((token) => {
   assert.equal(script.includes(token), false, `token should be removed: ${token}`);
 });
+
+assert.equal(
+  script.includes('applyKeepCoopClass('),
+  false,
+  'dangling applyKeepCoopClass call should be removed'
+);
