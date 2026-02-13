@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.13
+// @version      1.2.14
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -549,7 +549,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.13';
+  const SCRIPT_VERSION = '1.2.14';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -693,14 +693,14 @@ if (__CGPT_BROWSER__) {
   // ========================== 服务降级监控常量 ==========================
   const DEG_STATUS_REFRESH_OK_MS = 15 * 60 * 1000;
   const DEG_STATUS_REFRESH_ALERT_MS = 6 * 60 * 1000;
-  const DEG_IP_REFRESH_MS = 6 * 60 * 1000;
+  const DEG_IP_REFRESH_MS = 5 * 60 * 1000;
   const DEG_FETCH_MONITOR_FAST_MS = 1200;
   const DEG_FETCH_MONITOR_SLOW_MS = 7000;
   const DEG_STATUS_TTL_MS = 35 * 60 * 1000;
   const DEG_IP_TTL_MS = 12 * 60 * 1000;
   const DEG_POW_TTL_MS = 6 * 60 * 1000;
   const DEG_POW_PROBE_COOLDOWN_MS = 90 * 1000;
-  const DEG_IP_COOLDOWN_MS = 12 * 1000;
+  const DEG_IP_COOLDOWN_MS = DEG_IP_REFRESH_MS;
   const DEG_REQ_TIMEOUT_MS = 5000;
   const DEG_CACHE_KEY = 'cgpt_glass_degraded_cache';
   const DEG_CACHE_VERSION = 1;
