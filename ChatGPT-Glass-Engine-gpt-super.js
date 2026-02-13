@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Glass Engine super
 // @namespace    local.chatgpt.optimizer
-// @version      1.2.12
+// @version      1.2.13
 // @description  玻璃态长对话引擎：虚拟滚动 + 红绿灯健康度 + 服务降级监控（状态/IP/PoW）+ 自动避让回复
 // @license      MIT
 // @downloadURL  https://raw.githubusercontent.com/palmcivetcn/chatgpt-vsGPT-SelfUsed/main/ChatGPT-Glass-Engine-gpt-super.js
@@ -125,6 +125,19 @@ function resolveWorstHealthLevel({
     else if (degradedSeverity === 'warn' && worst === 'ok') worst = 'warn';
   }
   return worst;
+}
+
+function resolveDomLevel(domNodes, {
+  domOk = 7000,
+  domWarn = 15000,
+  domBad = 22000
+} = {}) {
+  if (!Number.isFinite(domNodes) || domNodes <= 0) {
+    return { level: 'na' };
+  }
+  if (domNodes < domOk) return { level: 'ok' };
+  if (domNodes < domBad) return { level: 'warn' };
+  return { level: 'bad' };
 }
 
 function resolvePersistedRaw({
@@ -468,6 +481,7 @@ if (typeof module !== 'undefined' && module.exports) {
     evaluatePauseReason,
     resolveUiRefreshDecision,
     resolveWorstHealthLevel,
+    resolveDomLevel,
     resolvePersistedRaw,
     resolveConversationRouteInfo,
     resolveRouteAutoScrollDecision,
@@ -535,7 +549,7 @@ if (__CGPT_BROWSER__) {
   const RESTORE_LAST_OPEN = false;
   const INIT_LIGHT_UI_MS = 1200;
   const INIT_VIRTUALIZE_DELAY_MS = 600;
-  const SCRIPT_VERSION = '1.2.12';
+  const SCRIPT_VERSION = '1.2.13';
   const VS_SLIM_CLASS = 'cgpt-vs-slim';
   const LAYER_COMPAT_SCOPE = 'dual';
   const LAYER_Z_NORMAL = 2147483647;
@@ -634,6 +648,7 @@ if (__CGPT_BROWSER__) {
 
   const DOM_OK = 7000;
   const DOM_WARN = 15000;
+  const DOM_BAD = 22000;
 
   // Auto optimize only after chat volume reaches a likely-lag threshold.
   const AUTO_OPTIMIZE_MIN_TURNS = MARGIN_TURN_STEPS[0];
@@ -5374,17 +5389,22 @@ if (__CGPT_BROWSER__) {
   }
 
   function domLevel(domNodes) {
-    if (!Number.isFinite(domNodes) || domNodes <= 0) {
+    const resolved = resolveDomLevel(domNodes, {
+      domOk: DOM_OK,
+      domWarn: DOM_WARN,
+      domBad: DOM_BAD
+    });
+    if (resolved.level === 'na') {
       return {
         label: lang === 'zh' ? '不可用' : 'N/A',
         level: 'na'
       };
     }
-    if (domNodes < DOM_OK) return {
+    if (resolved.level === 'ok') return {
       label: `${domNodes}`,
       level: 'ok'
     };
-    if (domNodes < DOM_WARN) return {
+    if (resolved.level === 'warn') return {
       label: `${domNodes}`,
       level: 'warn'
     };
@@ -9116,13 +9136,19 @@ if (__CGPT_BROWSER__) {
       let reasonText = pauseReasonText(displayPauseReason);
       if (!paused) {
         const reasons = [];
+        if (memInfo.level === 'bad' || memInfo.level === 'warn') {
+          reasons.push(lang === 'zh' ? '内存' : 'Memory');
+        }
+        if (domInfo.level === 'bad' || domInfo.level === 'warn') {
+          reasons.push('DOM');
+        }
         if (degraded.serviceSev === 'bad' || degraded.serviceSev === 'warn') reasons.push(t('monitorService'));
         if (degraded.ipSev === 'bad' || degraded.ipSev === 'warn') reasons.push(t('monitorIp'));
         if (degraded.powSev === 'bad' || degraded.powSev === 'warn') reasons.push(t('monitorPow'));
         if (reasons.length) {
           reasonText = lang === 'zh'
-            ? `监控提示：${reasons.join(' / ')} 偏高`
-            : `Monitor: ${reasons.join(' / ')} is elevated.`;
+            ? `状态提示：${reasons.join(' / ')} 偏高`
+            : `Status: ${reasons.join(' / ')} is elevated.`;
         }
       }
       reasonEl.textContent = reasonText;
